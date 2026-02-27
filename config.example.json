@@ -1,0 +1,9 @@
+{
+  "node_id": "nX",
+  "node_name": "Node X - Name",
+  "db_path": "./db/myr.db",
+  "keys_path": "./keys/",
+  "export_path": "./exports/",
+  "import_path": "./imports/",
+  "peers": []
+}

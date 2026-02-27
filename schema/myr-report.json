@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "MYR Report",
+  "description": "Methodological Yield Report — captures compounding intelligence from OODA cycles",
+  "type": "object",
+  "required": ["id", "timestamp", "agent_id", "node_id", "cycle", "yield"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9]+-\\d{8}-\\d{3}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "agent_id": {
+      "type": "string"
+    },
+    "node_id": {
+      "type": "string"
+    },
+    "session_ref": {
+      "type": ["string", "null"]
+    },
+    "cycle": {
+      "type": "object",
+      "required": ["intent"],
+      "properties": {
+        "intent": { "type": "string" },
+        "domain_tags": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "context": { "type": ["string", "null"] }
+      }
+    },
+    "yield": {
+      "type": "object",
+      "required": ["type", "question_answered", "evidence", "what_changes_next"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["technique", "insight", "falsification", "pattern"]
+        },
+        "question_answered": { "type": "string" },
+        "evidence": { "type": "string" },
+        "what_changes_next": { "type": "string" },
+        "what_was_falsified": { "type": ["string", "null"] },
+        "transferable_to": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "properties": {
+        "jordan_rating": { "type": ["integer", "null"], "minimum": 1, "maximum": 5 },
+        "jordan_notes": { "type": ["string", "null"] },
+        "verified_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "network": {
+      "type": "object",
+      "properties": {
+        "signed_by": { "type": ["string", "null"] },
+        "shared_with": { "type": "array", "items": { "type": "string" } },
+        "synthesis_id": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

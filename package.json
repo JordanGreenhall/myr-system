@@ -1,0 +1,21 @@
+{
+  "name": "myr-system",
+  "version": "1.0.0",
+  "description": "Methodological Yield Reports — a pistis-native intelligence compounding system",
+  "scripts": {
+    "store": "node scripts/myr-store.js",
+    "search": "node scripts/myr-search.js",
+    "weekly": "node scripts/myr-weekly.js",
+    "verify": "node scripts/myr-verify.js",
+    "keygen": "node scripts/myr-keygen.js",
+    "sign": "node scripts/myr-sign.js",
+    "export": "node scripts/myr-export.js",
+    "import": "node scripts/myr-import.js",
+    "synthesize": "node scripts/myr-synthesize.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "chalk": "^4.1.2",
+    "commander": "^13.1.0"
+  }
+}
