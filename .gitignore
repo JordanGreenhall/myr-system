@@ -1,6 +1,8 @@
 config.json
 keys/*.pem
 db/myr.db
+db/myr.db-wal
+db/myr.db-shm
 exports/
 imports/
 node_modules/
