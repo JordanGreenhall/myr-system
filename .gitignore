@@ -4,3 +4,4 @@ db/myr.db
 exports/
 imports/
 node_modules/
+.DS_Store
