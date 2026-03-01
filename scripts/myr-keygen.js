@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
+const { validateConfig } = require('./config');
 
 program
   .name('myr-keygen')
@@ -36,6 +37,20 @@ function main() {
 
   fs.writeFileSync(privateKeyPath, privateKey, 'utf8');
   fs.writeFileSync(publicKeyPath, publicKey, 'utf8');
+
+  // Write node_uuid to config.json if not already present
+  const configPath = require('path').join(__dirname, '..', 'config.json');
+  let configJson = {};
+  if (fs.existsSync(configPath)) {
+    try { configJson = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch (_) {}
+  }
+  if (!configJson.node_uuid) {
+    configJson.node_uuid = crypto.randomUUID();
+    fs.writeFileSync(configPath, JSON.stringify(configJson, null, 2), 'utf8');
+    console.log(`  UUID:    ${configJson.node_uuid}`);
+  } else {
+    console.log(`  UUID:    ${configJson.node_uuid} (existing)`);
+  }
 
   console.log(`Keypair generated for node "${config.node_id}"`);
   console.log(`  Private: ${privateKeyPath}`);

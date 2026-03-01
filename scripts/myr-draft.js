@@ -70,6 +70,7 @@ const VALID_TYPES = ['technique', 'insight', 'falsification', 'pattern'];
 const PLACEHOLDER = '[AUTO-DRAFT]';
 
 async function main() {
+  validateConfig();
   const opts = parseArgs();
 
   const prompt = `You are extracting structured methodological yield from a memory record.

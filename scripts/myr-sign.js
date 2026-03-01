@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
+const { validateConfig } = require('./config');
 const { getDb } = require('./db');
 
 program
@@ -108,6 +109,7 @@ function signRow(db, row, privateKeyPem, publicKeyPem) {
 }
 
 function main() {
+  validateConfig();
   if (!opts.id && !opts.all) {
     console.error('Provide --id <myr-id> or --all to sign MYRs.');
     process.exit(1);

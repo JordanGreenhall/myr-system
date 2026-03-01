@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
+const { validateConfig } = require('./config');
 const { getDb } = require('./db');
 
 program
@@ -87,6 +88,7 @@ function signPayload(payload, privateKeyPem, publicKeyPem) {
     signature: {
       algorithm: 'Ed25519',
       node_id: config.node_id,
+      node_uuid: config.node_uuid || null,
       public_key: pubKeyDer.toString('base64'),
       signed_at: new Date().toISOString(),
       value: sig.toString('base64'),
@@ -95,6 +97,8 @@ function signPayload(payload, privateKeyPem, publicKeyPem) {
 }
 
 function main() {
+  validateConfig();
+
   if (!opts.all && !opts.since && !opts.ids) {
     console.error('Provide --all, --since <date>, or --ids "id1,id2"');
     process.exit(1);

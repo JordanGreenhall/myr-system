@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const config = require('./config');
+const { validateConfig } = require('./config');
 const { getDb } = require('./db');
 
 program
@@ -72,8 +73,16 @@ function resolvePeerKey(db, artifact) {
 }
 
 function registerPeer(db, nodeId, publicKeyPem) {
-  const existing = db.prepare('SELECT node_id FROM myr_peers WHERE node_id = ?').get(nodeId);
+  const existing = db.prepare('SELECT node_id, public_key FROM myr_peers WHERE node_id = ?').get(nodeId);
   if (existing) {
+    // Key binding check: registered node_id must match known public key
+    if (existing.public_key && existing.public_key.trim() !== publicKeyPem.trim()) {
+      console.error(`\nKEY BINDING MISMATCH: node_id \${nodeId}\ is registered with a different public key.`);
+      console.error('This may indicate key rotation or an impersonation attempt.');
+      console.error('Resolve manually before importing from this node.');
+      console.error('  - If legitimate key rotation: delete peer record from DB and re-import with --peer-key');
+      process.exit(3);
+    }
     db.prepare('UPDATE myr_peers SET last_import_at = ? WHERE node_id = ?')
       .run(new Date().toISOString(), nodeId);
     return;
@@ -85,7 +94,36 @@ function registerPeer(db, nodeId, publicKeyPem) {
   `).run(nodeId, '', publicKeyPem, new Date().toISOString(), new Date().toISOString());
 }
 
+
+function preflight(artifacts, localConfig) {
+  const peerIds = new Set(artifacts.map(a => a.signature?.node_id).filter(Boolean));
+  const peerUuids = new Set(artifacts.map(a => a.signature?.node_uuid).filter(Boolean));
+
+  for (const peerId of peerIds) {
+    if (peerId === localConfig.node_id) {
+      // Check if node_uuid also matches — definitive self-origin vs label collision
+      const localUuid = localConfig.node_uuid;
+      const hasPeerUuid = peerUuids.size > 0;
+      if (localUuid && hasPeerUuid && peerUuids.has(localUuid)) {
+        console.error(`\nPREFLIGHT FAILED: This package was exported from this node.`);
+        console.error(`  node_id: ${peerId} | node_uuid: ${localUuid}`);
+        console.error(`  You cannot import your own artifacts.`);
+      } else {
+        console.error(`\nPREFLIGHT FAILED: Peer node_id \${peerId}\ matches your local node_id.`);
+        console.error(`  This is a label collision — two different nodes using the same node_id.`);
+        console.error(`\nRemediation:`);
+        console.error(`  1. Ask peer to set a unique node_id in their config.json and re-export.`);
+        console.error(`  2. Emergency override: MYR_NODE_ID=mynode node scripts/myr-import.js --file ...`);
+        console.error(`     (override mode: verify peer key fingerprint manually before trusting)`);
+      }
+      process.exit(2);
+    }
+  }
+}
+
 function main() {
+  validateConfig();
+
   if (!opts.file) {
     program.help();
     return;
@@ -106,6 +144,8 @@ function main() {
     process.exit(1);
   }
 
+  preflight(artifacts, config);
+
   const db = getDb();
   const counts = { accepted: 0, rejected: 0, skipped: 0 };
   const reasons = [];
@@ -121,8 +161,9 @@ function main() {
     }
 
     if (peerNodeId === config.node_id) {
+      // Preflight should have caught this, but guard here too
       counts.rejected++;
-      reasons.push(`[${id}] node_id matches our own (${config.node_id})`);
+      reasons.push(`[${id}] rejected: node_id collision with local node (${config.node_id})`);
       continue;
     }
 

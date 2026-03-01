@@ -44,3 +44,17 @@ function loadConfig() {
 const config = loadConfig();
 
 module.exports = config;
+// HARDENING: Validate node identity before operating
+function validateConfig(cfg) {
+  cfg = cfg || config;
+  if (cfg.node_id === 'n1' && !process.env.MYR_NODE_ID) {
+    console.error('ERROR: node_id is still the default "n1".');
+    console.error('Set a unique node_id in config.json before operating:');
+    console.error('  { "node_id": "yourname-node", "node_name": "Your Name" }');
+    console.error('Or set: MYR_NODE_ID=yourname-node node scripts/myr-export.js ...');
+    console.error('Run `node scripts/myr-identity.js` to verify your identity.');
+    process.exit(1);
+  }
+}
+
+module.exports.validateConfig = validateConfig;
