@@ -42,6 +42,32 @@ Set environment:
 export MYR_HOME=/absolute/path/to/myr-system
 ```
 
+## Node Identity
+
+Every node must have a unique `node_id` and a `node_uuid`. These are set during keygen and enforced at runtime.
+
+**All scripts refuse to run if `node_id` is still the default `"n1"`.** You will get an error with remediation steps and exit 1.
+
+`myr-keygen` generates your keypair and writes `node_uuid` to `config.json` automatically. Verify your identity before any cross-node exchange:
+
+```bash
+node $MYR_HOME/scripts/myr-identity.js
+```
+
+Output:
+```
+MYR Node Identity
+─────────────────────────────────────────
+  node_id:     n2
+  node_uuid:   0c12b56f-0e44-44df-82a9-53d32dd0b1f3
+  key:         SHA256:212a98c0e6f6b3c9…
+
+  Fingerprint: n2 / 0c12b56f / SHA256:212a98c0e6f6b3c9…
+─────────────────────────────────────────
+```
+
+**Before exchanging packages with a peer:** run `myr-identity.js` on both nodes. Read your fingerprint to your peer out-of-band and confirm theirs. Only proceed once fingerprints are mutually confirmed.
+
 ## Verify Installation (Ping Test)
 
 Run all five. All must succeed.
@@ -121,6 +147,12 @@ Produces signed JSON artifact in `$MYR_HOME/exports/` containing only eligible r
 
 ### Import peer yield
 
+Import runs a preflight scan before touching the database. Two distinct errors:
+- **"You are importing your own artifacts"** — `node_id` and `node_uuid` both match your node. Exit 2.
+- **"Label collision between two different nodes"** — `node_id` matches but `node_uuid` differs. Peer must set a unique `node_id` and re-export. Exit 2.
+
+If the peer's public key is already registered and a new import presents a different key for the same `node_id`, import exits 3 with remediation. No silent key overwrite.
+
 ```bash
 node $MYR_HOME/scripts/myr-import.js --file path.myr.json [--peer-key keys/n2.public.pem]
 ```
@@ -144,7 +176,8 @@ Identifies convergent findings, divergences, and unique contributions.
 
 To become a peer in the Starfighter/Pistis network:
 1. Install and verify node
-2. Exchange public keys with an existing peer (`$MYR_HOME/keys/{node_id}.public.pem`)
+2. Run `myr-identity.js` and exchange fingerprints out-of-band with your peer before touching packages
+3. Exchange public keys (`$MYR_HOME/keys/{node_id}.public.pem`)
 3. Produce real OODA yield (at least 10 MYRs with concrete evidence and explicit operational changes)
 4. Complete operator review cycle (average rating >=3.0 over the most recent 10 reviewed MYRs)
 5. Exchange signed artifacts and import peer artifacts
@@ -188,3 +221,4 @@ Reference implementation: `$MYR_HOME/docs/INTEGRATION-EXAMPLES.md`
 
 For network protocol and scale roadmap (3 -> 300,000 nodes), see:
 `$MYR_HOME/docs/NETWORK-ARCHITECTURE.md`
+
