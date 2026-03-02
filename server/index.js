@@ -228,6 +228,42 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     });
   });
 
+  // --- Peer announce endpoint (auth required, unknown peers allowed) ---
+  app.post('/myr/peers/announce', (req, res) => {
+    const body = req.body || {};
+    const requiredFields = ['peer_url', 'public_key', 'operator_name', 'timestamp', 'nonce'];
+    for (const field of requiredFields) {
+      if (!body[field]) {
+        return errorResponse(res, 'invalid_request',
+          `Missing required field: ${field}`);
+      }
+    }
+
+    if (body.public_key !== req.auth.publicKey) {
+      return errorResponse(res, 'key_mismatch',
+        'public_key in body does not match X-MYR-Public-Key header');
+    }
+
+    const existing = db.prepare(
+      'SELECT id FROM myr_peers WHERE public_key = ?'
+    ).get(body.public_key);
+    if (existing) {
+      return errorResponse(res, 'peer_exists',
+        'Peer relationship already exists with this public_key');
+    }
+
+    db.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(body.peer_url, body.operator_name, body.public_key, 'pending', new Date().toISOString());
+
+    res.json({
+      status: 'pending_approval',
+      our_public_key: publicKeyHex,
+      message: 'Peer request received. Awaiting operator approval.',
+      approval_required: true,
+    });
+  });
+
   // --- Report fetch endpoint (auth required, trusted peers only) ---
   app.get('/myr/reports/:signature', (req, res) => {
     const publicKey = req.auth.publicKey;
