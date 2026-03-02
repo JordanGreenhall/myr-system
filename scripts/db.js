@@ -18,6 +18,7 @@ function getDb() {
   ensureSchema(db);
   migratePhase2Columns(db);
   migrateIdScheme(db);
+  migrateNoncesTable(db);
 
   return db;
 }
@@ -169,6 +170,17 @@ function migrateIdScheme(db) {
   }
 
   console.log(`Migrated ${oldRows.length} record(s) from myr-YYYY-MM-DD to ${nodeId}-YYYYMMDD format.`);
+}
+
+function migrateNoncesTable(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS myr_nonces (
+      nonce TEXT PRIMARY KEY,
+      seen_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_nonces_expires ON myr_nonces(expires_at);
+  `);
 }
 
 function generateId(db) {

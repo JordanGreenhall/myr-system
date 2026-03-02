@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { errorResponse } = require('./lib/errors');
+const { createAuthMiddleware } = require('./middleware/auth');
 
 function loadPublicKeyHex(keysPath, nodeId) {
   const publicKeyPath = path.join(keysPath, `${nodeId}.public.pem`);
@@ -35,7 +36,11 @@ function safeCount(db, sql) {
  */
 function createApp({ config, db, publicKeyHex, createdAt }) {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf.toString('utf8');
+    },
+  }));
 
   const port = config.port || 3719;
   const nodeUrl = config.node_url || `http://localhost:${port}`;
@@ -126,12 +131,34 @@ function createApp({ config, db, publicKeyHex, createdAt }) {
     }
   });
 
+  // Auth middleware for all subsequent (protected) routes
+  app.use(createAuthMiddleware(db));
+
   return app;
 }
 
-function startServer() {
+async function startServer() {
   const config = require('../scripts/config');
+  await loadKeyPair(config);
   const { getDb } = require('../scripts/db');
+const { generateKeypair } = require('./lib/crypto');
+const fsPromises = require('fs').promises;
+
+async function loadKeyPair(config) {
+  try {
+    const keypairPath = config.keypairPath || process.env.MYR_KEYPAIR_PATH;
+    if (!keypairPath) {
+      throw new Error('Missing keypair path');
+    }
+    const raw = await fsPromises.readFile(keypairPath, 'utf8');
+    global.keyPair = JSON.parse(raw);
+    global.keypairPath = keypairPath;
+    console.log("Keypair loaded from " + keypairPath)
+  } catch (e) {
+    console.error("Unable to load keypair from config: " + e.message);
+    process.exit(1);
+  }
+}
   const db = getDb();
 
   const port = config.port || parseInt(process.env.MYR_PORT, 10) || 3719;
