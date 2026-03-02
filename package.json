@@ -11,9 +11,12 @@
     "sign": "node scripts/myr-sign.js",
     "export": "node scripts/myr-export.js",
     "import": "node scripts/myr-import.js",
-    "synthesize": "node scripts/myr-synthesize.js"
+    "synthesize": "node scripts/myr-synthesize.js",
+    "test": "node --test 'test/*.test.js'"
   },
   "dependencies": {
+    "@noble/ed25519": "^3.0.0",
+    "@noble/hashes": "^2.0.1",
     "better-sqlite3": "^11.8.1",
     "chalk": "^4.1.2",
     "commander": "^13.1.0"
