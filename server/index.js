@@ -137,28 +137,9 @@ function createApp({ config, db, publicKeyHex, createdAt }) {
   return app;
 }
 
-async function startServer() {
+function startServer() {
   const config = require('../scripts/config');
-  await loadKeyPair(config);
   const { getDb } = require('../scripts/db');
-const { generateKeypair } = require('./lib/crypto');
-const fsPromises = require('fs').promises;
-
-async function loadKeyPair(config) {
-  try {
-    const keypairPath = config.keypairPath || process.env.MYR_KEYPAIR_PATH;
-    if (!keypairPath) {
-      throw new Error('Missing keypair path');
-    }
-    const raw = await fsPromises.readFile(keypairPath, 'utf8');
-    global.keyPair = JSON.parse(raw);
-    global.keypairPath = keypairPath;
-    console.log("Keypair loaded from " + keypairPath)
-  } catch (e) {
-    console.error("Unable to load keypair from config: " + e.message);
-    process.exit(1);
-  }
-}
   const db = getDb();
 
   const port = config.port || parseInt(process.env.MYR_PORT, 10) || 3719;
