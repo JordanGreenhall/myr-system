@@ -51,8 +51,8 @@ function generate() {
   const byType = { technique: [], insight: [], falsification: [], pattern: [] };
   rows.forEach(r => byType[r.yield_type].push(r));
 
-  const unverified = rows.filter(r => r.jordan_rating == null && !r.auto_draft);
-  const verified = rows.filter(r => r.jordan_rating != null);
+  const unverified = rows.filter(r => r.operator_rating == null && !r.auto_draft);
+  const verified = rows.filter(r => r.operator_rating != null);
   const autoDrafts = rows.filter(r => r.auto_draft);
 
   const topInsights = rows
@@ -83,7 +83,7 @@ function generate() {
   if (topInsights.length > 0) {
     md += `## Top Insights (by confidence)\n\n`;
     topInsights.forEach((r, i) => {
-      const rating = r.jordan_rating != null ? ` | ★${r.jordan_rating}` : '';
+      const rating = r.operator_rating != null ? ` | ★${r.operator_rating}` : '';
       md += `### ${i + 1}. ${r.cycle_intent}\n`;
       md += `**ID:** ${r.id} | **Confidence:** ${r.confidence}${rating}\n\n`;
       md += `- **Q:** ${r.question_answered}\n`;
@@ -120,7 +120,7 @@ function generate() {
   }
 
   if (unverified.length > 0) {
-    md += `## Unverified — Awaiting Jordan's Review\n\n`;
+    md += `## Unverified — Awaiting Operator Review\n\n`;
     unverified.forEach((r) => {
       md += `- **${r.id}** (${r.yield_type}): ${r.cycle_intent}\n`;
     });

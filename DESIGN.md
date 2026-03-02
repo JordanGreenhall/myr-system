@@ -62,8 +62,8 @@ From `DARKNET-MINING-PISTIS.md`:
   },
 
   "verification": {
-    "jordan_rating": null,
-    "jordan_notes": null,
+    "operator_rating": null,
+    "operator_notes": null,
     "verified_at": null
   },
 
@@ -110,7 +110,7 @@ Retrieve relevant yield when starting a new cycle.
 - `--tags "tag1,tag2"` — filter by domain tags
 - `--type technique|insight|falsification|pattern` — filter by yield type
 - `--limit N` — max results (default 5)
-- `--unverified` — show only Jordan-unverified reports (for verification queue)
+- `--unverified` — show only unverified reports (for verification queue)
 
 **Output:** Formatted list of matching MYRs with relevance indicators.
 
@@ -185,8 +185,8 @@ CREATE TABLE myr_reports (
   confidence REAL NOT NULL DEFAULT 0.7,
 
   -- verification
-  jordan_rating INTEGER,
-  jordan_notes TEXT,
+  operator_rating INTEGER,
+  operator_notes TEXT,
   verified_at TEXT,
 
   -- network (Phase 2)

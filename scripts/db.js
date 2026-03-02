@@ -17,6 +17,7 @@ function getDb() {
 
   ensureSchema(db);
   migratePhase2Columns(db);
+  migrateOperatorColumns(db);
   migrateIdScheme(db);
 
   return db;
@@ -43,8 +44,8 @@ function ensureSchema(db) {
       transferable_to TEXT,
       confidence REAL NOT NULL DEFAULT 0.7,
 
-      jordan_rating INTEGER,
-      jordan_notes TEXT,
+      operator_rating INTEGER,
+      operator_notes TEXT,
       verified_at TEXT,
 
       signed_by TEXT,
@@ -134,6 +135,19 @@ function migratePhase2Columns(db) {
   addColumn('myr_reports', 'import_verified', 'INTEGER DEFAULT 0');
   addColumn('myr_reports', 'auto_draft', 'INTEGER DEFAULT 0');
   addColumn('myr_reports', 'source_memory_id', 'INTEGER');
+}
+
+function migrateOperatorColumns(db) {
+  // Rename jordan_rating -> operator_rating and jordan_notes -> operator_notes
+  const cols = db.prepare("PRAGMA table_info(myr_reports)").all();
+  const hasJordanRating = cols.some(c => c.name === 'jordan_rating');
+  const hasOperatorRating = cols.some(c => c.name === 'operator_rating');
+
+  if (hasJordanRating && !hasOperatorRating) {
+    db.exec('ALTER TABLE myr_reports RENAME COLUMN jordan_rating TO operator_rating');
+    db.exec('ALTER TABLE myr_reports RENAME COLUMN jordan_notes TO operator_notes');
+    console.log('Migrated jordan_rating/jordan_notes -> operator_rating/operator_notes.');
+  }
 }
 
 function migrateIdScheme(db) {

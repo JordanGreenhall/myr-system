@@ -7,7 +7,7 @@ const { getDb } = require('./db');
 
 program
   .name('myr-verify')
-  .description("Jordan's verification interface for MYR reports")
+  .description("Operator verification interface for MYR reports")
   .option('--queue', 'Review unverified MYRs one at a time')
   .option('--id <myr-id>', 'Verify a specific MYR by ID')
   .option('--rating <n>', 'Rating 1-5', parseInt)
@@ -48,7 +48,7 @@ function applyVerification(db, id, rating, notes) {
 
   const now = new Date().toISOString();
   const result = db.prepare(
-    'UPDATE myr_reports SET jordan_rating = ?, jordan_notes = ?, verified_at = ?, updated_at = ? WHERE id = ?'
+    'UPDATE myr_reports SET operator_rating = ?, operator_notes = ?, verified_at = ?, updated_at = ? WHERE id = ?'
   ).run(rating, notes || null, now, now, id);
 
   if (result.changes === 0) {
@@ -62,7 +62,7 @@ function applyVerification(db, id, rating, notes) {
 async function queueMode() {
   const db = getDb();
   const unverified = db.prepare(
-    'SELECT * FROM myr_reports WHERE jordan_rating IS NULL ORDER BY created_at ASC'
+    'SELECT * FROM myr_reports WHERE operator_rating IS NULL ORDER BY created_at ASC'
   ).all();
 
   if (unverified.length === 0) {
