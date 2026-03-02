@@ -62,8 +62,8 @@ From `DARKNET-MINING-PISTIS.md`:
   },
 
   "verification": {
-    "jordan_rating": null,
-    "jordan_notes": null,
+    "operator_rating": null,
+    "operator_notes": null,
     "verified_at": null
   },
 
@@ -141,7 +141,7 @@ node scripts/myr-weekly.js --output report.md # write to file
 ### 4. myr-verify.js
 Jordan's interface to review and rate MYR quality.
 
-**Purpose:** Jordan's verification closes the feedback loop. Unverified MYRs are stored but flagged. Verified MYRs are the trusted corpus. Rating affects retrieval weighting.
+**Purpose:** Operator verification closes the feedback loop. Unverified MYRs are stored but flagged. Verified MYRs are the trusted corpus. Rating affects retrieval weighting.
 
 **Rating scale:** 1-5
 - 1: Inaccurate or useless
@@ -185,8 +185,8 @@ CREATE TABLE myr_reports (
   confidence REAL NOT NULL DEFAULT 0.7,
 
   -- verification
-  jordan_rating INTEGER,
-  jordan_notes TEXT,
+  operator_rating INTEGER,
+  operator_notes TEXT,
   verified_at TEXT,
 
   -- network (Phase 2)
@@ -255,7 +255,7 @@ This makes capture nearly zero-friction.
 **T1:** MYR captured in <60 seconds via CLI  
 **T2:** Search surfaces relevant prior yield when starting new cycle on known domain  
 **T3:** Weekly synthesis accurately represents what was actually learned (Jordan recognition test)  
-**T4:** Jordan's verification ratings correctly stored and affect retrieval weighting  
+**T4:** Operator verification ratings correctly stored and affect retrieval weighting  
 **T5:** Falsifications are always surfaced in weekly synthesis regardless of confidence  
 
 ---

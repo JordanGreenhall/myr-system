@@ -151,7 +151,7 @@ function store(data) {
       cycle_intent, domain_tags, cycle_context,
       yield_type, question_answered, evidence, what_changes_next,
       what_was_falsified, transferable_to, confidence,
-      jordan_rating, jordan_notes, verified_at,
+      operator_rating, operator_notes, verified_at,
       signed_by, shared_with, synthesis_id,
       created_at, updated_at
     ) VALUES (

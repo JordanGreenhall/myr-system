@@ -69,8 +69,8 @@ function rowToPayload(row) {
       confidence: row.confidence,
     },
     verification: {
-      jordan_rating: row.jordan_rating,
-      jordan_notes: row.jordan_notes || null,
+      operator_rating: row.operator_rating,
+      operator_notes: row.operator_notes || null,
       verified_at: row.verified_at || null,
     },
   });
@@ -116,16 +116,16 @@ function main() {
   } else if (opts.since) {
     const since = new Date(opts.since + 'T00:00:00Z').toISOString();
     rows = db.prepare(
-      "SELECT * FROM myr_reports WHERE jordan_rating >= 3 AND created_at >= ? AND (imported_from IS NULL OR imported_from = '')"
+      "SELECT * FROM myr_reports WHERE operator_rating >= 3 AND created_at >= ? AND (imported_from IS NULL OR imported_from = '')"
     ).all(since);
   } else {
     rows = db.prepare(
-      "SELECT * FROM myr_reports WHERE jordan_rating >= 3 AND (imported_from IS NULL OR imported_from = '')"
+      "SELECT * FROM myr_reports WHERE operator_rating >= 3 AND (imported_from IS NULL OR imported_from = '')"
     ).all();
   }
 
   if (rows.length === 0) {
-    console.log('No exportable MYRs found (must have jordan_rating >= 3).');
+    console.log('No exportable MYRs found (must have operator_rating >= 3).');
     db.close();
     return;
   }

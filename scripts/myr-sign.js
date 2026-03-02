@@ -59,8 +59,8 @@ function rowToPayload(row) {
       confidence: row.confidence,
     },
     verification: {
-      jordan_rating: row.jordan_rating,
-      jordan_notes: row.jordan_notes || null,
+      operator_rating: row.operator_rating,
+      operator_notes: row.operator_notes || null,
       verified_at: row.verified_at || null,
     },
   });
@@ -89,6 +89,7 @@ function signPayload(payload, privateKeyPem, publicKeyPem) {
     signature: {
       algorithm: 'Ed25519',
       node_id: config.node_id,
+      node_uuid: config.node_uuid || null,
       public_key: pubKeyDer.toString('base64'),
       signed_at: new Date().toISOString(),
       value: sign.toString('base64'),

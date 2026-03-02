@@ -43,8 +43,8 @@ function ensureSchema(db) {
       transferable_to TEXT,
       confidence REAL NOT NULL DEFAULT 0.7,
 
-      jordan_rating INTEGER,
-      jordan_notes TEXT,
+      operator_rating INTEGER,
+      operator_notes TEXT,
       verified_at TEXT,
 
       signed_by TEXT,
