@@ -59,8 +59,8 @@ function rowToPayload(row) {
       confidence: row.confidence,
     },
     verification: {
-      jordan_rating: row.jordan_rating,
-      jordan_notes: row.jordan_notes || null,
+      operator_rating: row.operator_rating,
+      operator_notes: row.operator_notes || null,
       verified_at: row.verified_at || null,
     },
   });

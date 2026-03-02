@@ -42,7 +42,7 @@ function search() {
   }
 
   if (opts.unverified) {
-    conditions.push('r.jordan_rating IS NULL');
+    conditions.push('r.operator_rating IS NULL');
   }
 
   const limit = opts.limit || 5;
@@ -56,9 +56,9 @@ function search() {
       SELECT r.*,
         myr_fts.rank AS fts_rank,
         CASE
-          WHEN r.jordan_rating >= 4 THEN 2.0
-          WHEN r.jordan_rating >= 3 THEN 1.5
-          WHEN r.jordan_rating IS NOT NULL THEN 1.0
+          WHEN r.operator_rating >= 4 THEN 2.0
+          WHEN r.operator_rating >= 3 THEN 1.5
+          WHEN r.operator_rating IS NOT NULL THEN 1.0
           ELSE 0.8
         END AS verification_boost
       FROM myr_fts
@@ -74,8 +74,8 @@ function search() {
     rows = db.prepare(`
       SELECT r.*,
         CASE
-          WHEN r.jordan_rating >= 4 THEN 2
-          WHEN r.jordan_rating >= 3 THEN 1
+          WHEN r.operator_rating >= 4 THEN 2
+          WHEN r.operator_rating >= 3 THEN 1
           ELSE 0
         END AS sort_weight
       FROM myr_reports r
@@ -91,8 +91,8 @@ function search() {
 
 function formatRow(row, idx) {
   const tags = JSON.parse(row.domain_tags || '[]');
-  const verified = row.jordan_rating != null;
-  const ratingStr = verified ? `★${row.jordan_rating}` : chalk.yellow('unverified');
+  const verified = row.operator_rating != null;
+  const ratingStr = verified ? `★${row.operator_rating}` : chalk.yellow('unverified');
 
   const lines = [
     chalk.bold(`${idx + 1}. [${row.id}]`) + ` ${chalk.gray(row.yield_type)} | ${ratingStr} | conf: ${row.confidence}`,

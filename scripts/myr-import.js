@@ -200,7 +200,7 @@ function main() {
         cycle_intent, domain_tags, cycle_context,
         yield_type, question_answered, evidence, what_changes_next,
         what_was_falsified, transferable_to, confidence,
-        jordan_rating, jordan_notes, verified_at,
+        operator_rating, operator_notes, verified_at,
         signed_by, shared_with, synthesis_id,
         imported_from, signed_artifact, import_verified,
         created_at, updated_at
@@ -219,7 +219,7 @@ function main() {
       cycle.intent, JSON.stringify(cycle.domain_tags || []), cycle.context || null,
       y.type, y.question_answered, y.evidence, y.what_changes_next,
       y.what_was_falsified || null, JSON.stringify(y.transferable_to || []), y.confidence || 0.7,
-      v.jordan_rating || null, v.jordan_notes || null, v.verified_at || null,
+      v.operator_rating || null, v.operator_notes || null, v.verified_at || null,
       peerNodeId,
       peerNodeId, JSON.stringify(artifact),
       now, now
