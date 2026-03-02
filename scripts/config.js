@@ -13,6 +13,9 @@ const DEFAULTS = {
   export_path: './exports/',
   import_path: './imports/',
   peers: [],
+  port: 3719,
+  node_url: null,
+  operator_name: null,
 };
 
 function loadConfig() {
@@ -31,6 +34,9 @@ function loadConfig() {
   if (process.env.MYR_NODE_ID) config.node_id = process.env.MYR_NODE_ID;
   if (process.env.MYR_DB_PATH) config.db_path = process.env.MYR_DB_PATH;
   if (process.env.MYR_NODE_NAME) config.node_name = process.env.MYR_NODE_NAME;
+  if (process.env.MYR_PORT) config.port = parseInt(process.env.MYR_PORT, 10);
+  if (process.env.MYR_NODE_URL) config.node_url = process.env.MYR_NODE_URL;
+  if (process.env.MYR_OPERATOR_NAME) config.operator_name = process.env.MYR_OPERATOR_NAME;
 
   // Resolve relative paths against project root
   config.db_path = path.resolve(ROOT, config.db_path);
