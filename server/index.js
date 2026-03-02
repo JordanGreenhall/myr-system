@@ -6,6 +6,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { errorResponse } = require('./lib/errors');
 const { createAuthMiddleware } = require('./middleware/auth');
+const { canonicalize } = require('../lib/canonicalize');
 
 function loadPublicKeyHex(keysPath, nodeId) {
   const publicKeyPath = path.join(keysPath, `${nodeId}.public.pem`);
@@ -133,6 +134,84 @@ function createApp({ config, db, publicKeyHex, createdAt }) {
 
   // Auth middleware for all subsequent (protected) routes
   app.use(createAuthMiddleware(db));
+
+  // --- Reports listing endpoint (auth required, trusted peers only) ---
+  app.get('/myr/reports', (req, res) => {
+    const publicKey = req.auth.publicKey;
+
+    const peer = db.prepare(
+      'SELECT trust_level FROM myr_peers WHERE public_key = ?'
+    ).get(publicKey);
+
+    if (!peer) {
+      return errorResponse(res, 'unknown_peer',
+        'Your public key is not in our peer list');
+    }
+
+    if (peer.trust_level !== 'trusted') {
+      return errorResponse(res, 'peer_not_trusted',
+        "Peer relationship exists but trust_level != 'trusted'");
+    }
+
+    const since = req.query.since || null;
+    let limit = 100;
+
+    if (req.query.limit !== undefined) {
+      limit = parseInt(req.query.limit, 10);
+      if (isNaN(limit) || limit < 1) {
+        return errorResponse(res, 'invalid_request',
+          'Invalid limit parameter: must be a positive integer');
+      }
+      limit = Math.min(limit, 500);
+    }
+
+    if (since && isNaN(new Date(since).getTime())) {
+      return errorResponse(res, 'invalid_request',
+        'Invalid since parameter: must be ISO8601 timestamp');
+    }
+
+    let rows, total;
+    if (since) {
+      rows = db.prepare(
+        'SELECT * FROM myr_reports WHERE share_network = 1 AND created_at > ? ORDER BY created_at ASC LIMIT ?'
+      ).all(since, limit);
+      total = db.prepare(
+        'SELECT COUNT(*) as cnt FROM myr_reports WHERE share_network = 1 AND created_at > ?'
+      ).get(since).cnt;
+    } else {
+      rows = db.prepare(
+        'SELECT * FROM myr_reports WHERE share_network = 1 ORDER BY created_at ASC LIMIT ?'
+      ).all(limit);
+      total = db.prepare(
+        'SELECT COUNT(*) as cnt FROM myr_reports WHERE share_network = 1'
+      ).get().cnt;
+    }
+
+    const reports = rows.map((row) => {
+      const reportObj = { ...row };
+      delete reportObj.signature;
+      delete reportObj.operator_signature;
+      const canonical = canonicalize(reportObj);
+      const hash = crypto.createHash('sha256').update(canonical).digest('hex');
+      const sig = 'sha256:' + hash;
+
+      return {
+        signature: sig,
+        operator_name: operatorName,
+        created_at: row.created_at,
+        method_name: row.cycle_intent,
+        operator_rating: row.operator_rating,
+        size_bytes: Buffer.byteLength(canonical, 'utf8'),
+        url: '/myr/reports/' + sig,
+      };
+    });
+
+    res.json({
+      reports,
+      total,
+      since,
+    });
+  });
 
   return app;
 }

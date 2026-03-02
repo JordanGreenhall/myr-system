@@ -135,6 +135,15 @@ function migratePhase2Columns(db) {
   addColumn('myr_reports', 'import_verified', 'INTEGER DEFAULT 0');
   addColumn('myr_reports', 'auto_draft', 'INTEGER DEFAULT 0');
   addColumn('myr_reports', 'source_memory_id', 'INTEGER');
+  addColumn('myr_reports', 'share_network', 'INTEGER DEFAULT 0');
+
+  addColumn('myr_peers', 'peer_url', 'TEXT');
+  addColumn('myr_peers', 'operator_name', 'TEXT');
+  addColumn('myr_peers', 'trust_level', "TEXT DEFAULT 'pending'");
+  addColumn('myr_peers', 'approved_at', 'TEXT');
+  addColumn('myr_peers', 'last_sync_at', 'TEXT');
+  addColumn('myr_peers', 'auto_sync', 'INTEGER DEFAULT 1');
+  addColumn('myr_peers', 'notes', 'TEXT');
 }
 
 function migrateIdScheme(db) {
