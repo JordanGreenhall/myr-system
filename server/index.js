@@ -7,12 +7,21 @@ const crypto = require('crypto');
 const { errorResponse } = require('./lib/errors');
 const { createAuthMiddleware } = require('./middleware/auth');
 const { canonicalize } = require('../lib/canonicalize');
+const { sign: signMessage } = require('../lib/crypto');
 
 function loadPublicKeyHex(keysPath, nodeId) {
   const publicKeyPath = path.join(keysPath, `${nodeId}.public.pem`);
   const pem = fs.readFileSync(publicKeyPath, 'utf8');
   const keyObj = crypto.createPublicKey(pem);
   const der = keyObj.export({ type: 'spki', format: 'der' });
+  return der.slice(-32).toString('hex');
+}
+
+function loadPrivateKeyHex(keysPath, nodeId) {
+  const privateKeyPath = path.join(keysPath, `${nodeId}.private.pem`);
+  const pem = fs.readFileSync(privateKeyPath, 'utf8');
+  const keyObj = crypto.createPrivateKey(pem);
+  const der = keyObj.export({ type: 'pkcs8', format: 'der' });
   return der.slice(-32).toString('hex');
 }
 
@@ -35,7 +44,7 @@ function safeCount(db, sql) {
  * Create the Express app. Accepts explicit publicKeyHex/createdAt for testing,
  * otherwise loads from the filesystem using config.keys_path and config.node_id.
  */
-function createApp({ config, db, publicKeyHex, createdAt }) {
+function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
   const app = express();
   app.use(express.json({
     verify: (req, res, buf) => {
@@ -51,6 +60,12 @@ function createApp({ config, db, publicKeyHex, createdAt }) {
     try {
       publicKeyHex = loadPublicKeyHex(config.keys_path, config.node_id);
     } catch { /* will return error on discovery endpoint */ }
+  }
+
+  if (!privateKeyHex && config.keys_path && config.node_id) {
+    try {
+      privateKeyHex = loadPrivateKeyHex(config.keys_path, config.node_id);
+    } catch { /* response signing won't be available */ }
   }
 
   if (!createdAt && config.keys_path && config.node_id) {
@@ -211,6 +226,67 @@ function createApp({ config, db, publicKeyHex, createdAt }) {
       total,
       since,
     });
+  });
+
+  // --- Report fetch endpoint (auth required, trusted peers only) ---
+  app.get('/myr/reports/:signature', (req, res) => {
+    const publicKey = req.auth.publicKey;
+
+    const peer = db.prepare(
+      'SELECT trust_level FROM myr_peers WHERE public_key = ?'
+    ).get(publicKey);
+
+    if (!peer) {
+      return errorResponse(res, 'unknown_peer',
+        'Your public key is not in our peer list');
+    }
+
+    if (peer.trust_level !== 'trusted') {
+      return errorResponse(res, 'peer_not_trusted',
+        "Peer relationship exists but trust_level != 'trusted'");
+    }
+
+    const requestedSig = req.params.signature;
+    const rows = db.prepare('SELECT * FROM myr_reports').all();
+
+    let matchedRow = null;
+    let computedSig = null;
+
+    for (const row of rows) {
+      const reportObj = { ...row };
+      delete reportObj.signature;
+      delete reportObj.operator_signature;
+      const canonical = canonicalize(reportObj);
+      const hash = crypto.createHash('sha256').update(canonical).digest('hex');
+      const sig = 'sha256:' + hash;
+
+      if (sig === requestedSig) {
+        matchedRow = row;
+        computedSig = sig;
+        break;
+      }
+    }
+
+    if (!matchedRow) {
+      return errorResponse(res, 'report_not_found',
+        `No report with signature ${requestedSig}`);
+    }
+
+    if (matchedRow.share_network !== 1) {
+      return errorResponse(res, 'report_not_shared',
+        'Report exists but share_network=false');
+    }
+
+    const report = { ...matchedRow, signature: computedSig };
+    const responseBody = JSON.stringify(report);
+
+    if (privateKeyHex) {
+      const responseSig = signMessage(responseBody, privateKeyHex);
+      res.set('X-MYR-Signature', responseSig);
+    }
+
+    res.set('Content-Type', 'application/json');
+    res.send(responseBody);
   });
 
   return app;

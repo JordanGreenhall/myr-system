@@ -24,9 +24,9 @@ function request(port, { method = 'GET', path, headers = {}, body } = {}) {
       res.on('data', (chunk) => (data += chunk));
       res.on('end', () => {
         try {
-          resolve({ status: res.statusCode, body: JSON.parse(data) });
+          resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(data), rawBody: data });
         } catch {
-          resolve({ status: res.statusCode, body: data });
+          resolve({ status: res.statusCode, headers: res.headers, body: data, rawBody: data });
         }
       });
     });
