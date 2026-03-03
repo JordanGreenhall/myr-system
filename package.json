@@ -13,7 +13,8 @@
     "import": "node scripts/myr-import.js",
     "synthesize": "node scripts/myr-synthesize.js",
     "test": "node --test 'test/*.test.js'",
-    "server": "node server/index.js"
+    "server": "node server/index.js",
+    "myr": "node bin/myr.js"
   },
   "dependencies": {
     "@noble/ed25519": "^3.0.0",
