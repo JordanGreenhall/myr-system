@@ -5,10 +5,8 @@ const { Command } = require('commander');
 const path = require('path');
 const fs = require('fs');
 const nodeCrypto = require('crypto');
-const http = require('http');
-const https = require('https');
 const { sign, fingerprint: computeFingerprint } = require('../lib/crypto');
-const { canonicalize } = require('../lib/canonicalize');
+const { syncPeer: syncPeerCore, makeSignedHeaders, httpFetch } = require('../lib/sync');
 
 // --- Key loading ---
 
@@ -29,53 +27,6 @@ function loadKeypair(config) {
     publicKey: loadPublicKeyHex(config.keys_path, config.node_id),
     privateKey: loadPrivateKeyHex(config.keys_path, config.node_id),
   };
-}
-
-// --- HTTP helpers ---
-
-function makeSignedHeaders({ method, urlPath, body, privateKey, publicKey }) {
-  const ts = new Date().toISOString();
-  const nonce = nodeCrypto.randomBytes(32).toString('hex');
-  const rawBody = body ? (typeof body === 'string' ? body : JSON.stringify(body)) : '';
-  const bodyHash = nodeCrypto.createHash('sha256').update(rawBody).digest('hex');
-  const canonical = `${method}\n${urlPath}\n${ts}\n${nonce}\n${bodyHash}`;
-  const sig = sign(canonical, privateKey);
-  return {
-    'x-myr-timestamp': ts,
-    'x-myr-nonce': nonce,
-    'x-myr-signature': sig,
-    'x-myr-public-key': publicKey,
-  };
-}
-
-function httpFetch(url, options = {}) {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const mod = parsed.protocol === 'https:' ? https : http;
-    const reqOptions = {
-      hostname: parsed.hostname,
-      port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
-      path: parsed.pathname + parsed.search,
-      method: options.method || 'GET',
-      headers: options.headers || {},
-    };
-    if (options.body) reqOptions.headers['content-type'] = 'application/json';
-
-    const req = mod.request(reqOptions, (res) => {
-      let data = '';
-      res.on('data', (chunk) => (data += chunk));
-      res.on('end', () => {
-        try {
-          resolve({ status: res.statusCode, body: JSON.parse(data), rawBody: data, headers: res.headers });
-        } catch {
-          resolve({ status: res.statusCode, body: data, rawBody: data, headers: res.headers });
-        }
-      });
-    });
-    req.on('error', reject);
-    if (options.body) req.write(typeof options.body === 'string' ? options.body : JSON.stringify(options.body));
-    req.end();
-  });
 }
 
 // --- Peer lookup ---
@@ -190,92 +141,24 @@ function getPeerFingerprint({ db, name }) {
 }
 
 async function syncPeer({ db, peerName, keys, fetch: fetchFn }) {
-  fetchFn = fetchFn || httpFetch;
   const peer = findPeer(db, peerName);
   if (!peer) throw new Error(`No peer found matching "${peerName}"`);
   if (peer.trust_level !== 'trusted') {
     throw new Error(`Peer "${peer.operator_name}" is not trusted (status: ${peer.trust_level})`);
   }
 
-  let reportsUrl = peer.peer_url + '/myr/reports';
-  if (peer.last_sync_at) {
-    reportsUrl += `?since=${encodeURIComponent(peer.last_sync_at)}`;
-  }
+  const syncOpts = { db, peer, keys };
+  if (fetchFn) syncOpts.fetch = fetchFn;
 
-  const listHeaders = makeSignedHeaders({
-    method: 'GET',
-    urlPath: '/myr/reports',
-    body: null,
-    privateKey: keys.privateKey,
-    publicKey: keys.publicKey,
-  });
+  const result = await syncPeerCore(syncOpts);
 
-  const listRes = await fetchFn(reportsUrl, { headers: listHeaders });
-
-  if (listRes.status === 403 && listRes.body?.error?.code === 'peer_not_trusted') {
+  if (result.peerNotTrusted) {
     throw new Error(`Peer "${peer.operator_name}" has not approved us yet.`);
   }
-  if (listRes.status !== 200) {
-    throw new Error(`Failed to fetch reports: HTTP ${listRes.status}`);
-  }
-
-  const { reports } = listRes.body;
-  let imported = 0;
-
-  for (const reportMeta of reports) {
-    const fetchPath = reportMeta.url.split('?')[0];
-    const fetchHeaders = makeSignedHeaders({
-      method: 'GET',
-      urlPath: fetchPath,
-      body: null,
-      privateKey: keys.privateKey,
-      publicKey: keys.publicKey,
-    });
-
-    const reportRes = await fetchFn(peer.peer_url + reportMeta.url, { headers: fetchHeaders });
-    if (reportRes.status !== 200) continue;
-
-    const report = reportRes.body;
-
-    const reportCopy = { ...report };
-    delete reportCopy.signature;
-    delete reportCopy.operator_signature;
-    const canonical = canonicalize(reportCopy);
-    const hash = nodeCrypto.createHash('sha256').update(canonical).digest('hex');
-    if (report.signature && report.signature !== 'sha256:' + hash) continue;
-
-    const exists = db.prepare('SELECT id FROM myr_reports WHERE id = ?').get(report.id);
-    if (exists) continue;
-
-    try {
-      db.prepare(`
-        INSERT INTO myr_reports (id, timestamp, agent_id, node_id, session_ref,
-          cycle_intent, domain_tags, yield_type, question_answered,
-          evidence, what_changes_next, confidence, operator_rating,
-          created_at, updated_at, share_network, imported_from, import_verified)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        report.id, report.timestamp, report.agent_id, report.node_id,
-        report.session_ref || null,
-        report.cycle_intent, report.domain_tags,
-        report.yield_type, report.question_answered,
-        report.evidence, report.what_changes_next,
-        report.confidence || 0.7, report.operator_rating || null,
-        report.created_at, report.updated_at || report.created_at,
-        0, peer.operator_name, 1
-      );
-      imported++;
-    } catch {
-      // skip reports that fail to import
-    }
-  }
-
-  db.prepare('UPDATE myr_peers SET last_sync_at = ? WHERE public_key = ?')
-    .run(new Date().toISOString(), peer.public_key);
 
   return {
-    message: `Synced ${imported} new report${imported !== 1 ? 's' : ''} from ${peer.operator_name}`,
-    imported,
+    message: `Synced ${result.imported} new report${result.imported !== 1 ? 's' : ''} from ${peer.operator_name}`,
+    imported: result.imported,
     peerName: peer.operator_name,
   };
 }

@@ -39,7 +39,8 @@ function createTestDb() {
       updated_at TEXT NOT NULL,
       share_network INTEGER DEFAULT 0,
       imported_from TEXT,
-      import_verified INTEGER DEFAULT 0
+      import_verified INTEGER DEFAULT 0,
+      signed_artifact TEXT
     );
 
     CREATE TABLE myr_peers (
