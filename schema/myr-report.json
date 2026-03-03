@@ -57,12 +57,45 @@
         }
       }
     },
+    "lineage": {
+      "description": "Value-add graph lineage — tracks derivation from peer MYRs. Required when this MYR was informed by or derives from a peer's report. See docs/myr-value-add-graph.md for model.",
+      "type": "object",
+      "properties": {
+        "derived_from": {
+          "description": "Source MYR ID (maps from MC task field: myr_source). Format: {author}-{YYYYMMDD}-{NNN}",
+          "type": ["string", "null"],
+          "pattern": "^[a-z0-9]+-\\d{8}-\\d{3}$"
+        },
+        "derived_from_node": {
+          "description": "Node ID of the source author (maps from MC task field: myr_author, normalized to node id).",
+          "type": ["string", "null"]
+        },
+        "derived_relationship": {
+          "description": "How this MYR relates to the source. Maps from MC closeout field: verification_relationship.",
+          "type": ["string", "null"],
+          "enum": ["adoption", "refinement", "validation", "contradiction", null]
+        },
+        "derived_relationship_notes": {
+          "description": "Context on the relationship — what changed, what was confirmed, or what contradicted.",
+          "type": ["string", "null"]
+        }
+      }
+    },
     "verification": {
+      "description": "Operator's first-hand verification of this yield. verified_by_me must be true before a MYR influences operational decisions.",
       "type": "object",
       "properties": {
         "operator_rating": { "type": ["integer", "null"], "minimum": 1, "maximum": 5 },
         "operator_notes": { "type": ["string", "null"] },
-        "verified_at": { "type": ["string", "null"], "format": "date-time" }
+        "verified_at": { "type": ["string", "null"], "format": "date-time" },
+        "verified_by_me": {
+          "description": "True only if this operator personally tried and verified this yield in their own context.",
+          "type": ["boolean", "null"]
+        },
+        "verification_context": {
+          "description": "The specific context in which verification occurred (machine, project, date range, etc.).",
+          "type": ["string", "null"]
+        }
       }
     },
     "network": {
