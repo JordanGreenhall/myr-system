@@ -1,11 +1,12 @@
 ---
 name: myr
-description: Capture, search, verify, export, import, and synthesize Methodological Yield Reports (MYRs) for Starfighter/Pistis intelligence compounding. Use when: (1) installing MYR on a node, (2) storing yield from OODA cycles, (3) searching prior yield before new work, (4) operator-reviewing MYR quality, (5) exporting/importing signed MYRs between nodes, (6) generating weekly digests, or (7) integrating MYR with an agent memory system. Triggers: "install MYR", "store a MYR", "what did we learn about", "weekly yield", "export yield", "import yield", "methodological yield", "MYR".
+version: 1.1.0
+description: Capture, search, verify, export, import, and synthesize Methodological Yield Reports (MYRs) for OODA-based intelligence compounding. Use when: (1) installing MYR on a node, (2) storing yield from OODA cycles, (3) searching prior yield before new work, (4) operator-reviewing MYR quality, (5) exporting/importing signed MYRs between nodes, (6) running the HTTP server for live peer sync, (7) managing network peers, (8) generating weekly digests, or (9) integrating MYR with an agent memory system. Triggers: "install MYR", "store a MYR", "what did we learn about", "weekly yield", "export yield", "import yield", "methodological yield", "MYR", "peer sync", "start MYR server".
 ---
 
 # MYR — Methodological Yield Reports
 
-A pistis-native intelligence compounding system. Every meaningful OODA cycle (Observe, Orient, Decide, Act) produces yield — techniques, insights, falsifications, patterns. MYR captures it so it compounds across sessions, agents, and nodes.
+A pistis-native intelligence compounding system. Every meaningful OODA cycle (Observe, Orient, Decide, Act) produces yield — techniques, insights, falsifications, patterns. MYR captures it cryptographically signed so it compounds across sessions, agents, and nodes.
 
 **Repo:** https://github.com/JordanGreenhall/myr-system
 
@@ -27,7 +28,9 @@ cp config.example.json config.json
 ```
 
 Edit `config.json`:
-- Set unique `node_id` (short, e.g. `n2`, `north-star`)
+- Set unique `node_id` (short, e.g. `n2`, `north-star`) — **must not be `n1`**
+- Set `port` (default: 3719, choose any open port)
+- Set `node_url` to your externally reachable address (Tailscale IP recommended — see Network section)
 - Confirm paths and key locations are writable
 
 Generate keys:
@@ -48,7 +51,7 @@ Every node must have a unique `node_id` and a `node_uuid`. These are set during 
 
 **All scripts refuse to run if `node_id` is still the default `"n1"`.** You will get an error with remediation steps and exit 1.
 
-`myr-keygen` generates your keypair and writes `node_uuid` to `config.json` automatically. Verify your identity before any cross-node exchange:
+`myr-keygen` generates your keypair and writes `node_uuid` to `config.json` automatically. Verify your identity:
 
 ```bash
 node $MYR_HOME/scripts/myr-identity.js
@@ -66,8 +69,6 @@ MYR Node Identity
 ─────────────────────────────────────────
 ```
 
-**Before exchanging packages with a peer:** run `myr-identity.js` on both nodes. Read your fingerprint to your peer out-of-band and confirm theirs. Only proceed once fingerprints are mutually confirmed.
-
 ## Verify Installation (Ping Test)
 
 Run all five. All must succeed.
@@ -84,6 +85,165 @@ node scripts/myr-export.js --all
 ```
 
 If all five succeed, node is operational.
+
+---
+
+## HTTP Server (Live Peer Sync)
+
+MYR includes an HTTP server for live peer-to-peer synchronization. Peers sync automatically on a schedule — no manual package exchange required.
+
+### Start the server
+
+```bash
+cd $MYR_HOME
+node server/index.js
+```
+
+Output:
+```
+MYR node server listening on port 3719
+  Discovery: http://<your-ip>:3719/.well-known/myr-node
+  Health:    http://<your-ip>:3719/myr/health
+```
+
+### Run as a persistent service (macOS launchd)
+
+Create `~/Library/LaunchAgents/com.myr.server.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.myr.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/node</string>
+        <string>/path/to/myr-system/server/index.js</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/path/to/myr-system</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MYR_HOME</key>
+        <string>/path/to/myr-system</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/path/to/myr-system/logs/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/path/to/myr-system/logs/server-error.log</string>
+</dict>
+</plist>
+```
+
+```bash
+mkdir -p $MYR_HOME/logs
+launchctl load ~/Library/LaunchAgents/com.myr.server.plist
+```
+
+Verify:
+```bash
+curl http://localhost:<port>/myr/health
+```
+
+### Server endpoints
+
+| Endpoint | Auth | Purpose |
+|----------|------|---------|
+| `GET /.well-known/myr-node` | None | Node discovery (protocol version, public key, capabilities) |
+| `GET /myr/health` | None | Health check (status, peer count, report count) |
+| `GET /myr/reports` | Peer key | List shareable reports (supports `since`, `limit` params) |
+| `GET /myr/reports/:signature` | Peer key | Fetch individual report |
+| `POST /myr/peers/announce` | None | Peer announces itself for pairing |
+
+### Network reachability
+
+Peers must be able to reach each other's server. Options:
+
+- **Tailscale (recommended):** Install Tailscale on both nodes, set `node_url` to your Tailscale IP (e.g. `http://100.x.x.x:3719`). Private, encrypted, no port forwarding needed.
+- **VPN:** Any shared VPN works the same way.
+- **Public internet:** Set `node_url` to your public IP/domain with port forwarding. Less recommended.
+
+---
+
+## Peer Management
+
+The `bin/myr.js` CLI manages live peers.
+
+### Add a peer by URL
+
+```bash
+node $MYR_HOME/bin/myr.js add-peer http://<peer-tailscale-ip>:<port>
+```
+
+This fetches the peer's discovery document, registers their public key, and sets trust to `pending`.
+
+### Exchange fingerprints out-of-band (required)
+
+Before approving any peer, verify their fingerprint through a separate channel (voice, Signal, in-person):
+
+```bash
+# Your fingerprint — share this with your peer
+node $MYR_HOME/bin/myr.js fingerprint
+
+# Peer's fingerprint — confirm this matches what they told you
+node $MYR_HOME/bin/myr.js peer-fingerprint <peer-node-id>
+```
+
+**Do not approve a peer without confirming fingerprints out-of-band.** This is the trust anchor.
+
+### Approve or reject
+
+```bash
+node $MYR_HOME/bin/myr.js approve-peer <node-id-or-url>
+node $MYR_HOME/bin/myr.js reject-peer <node-id-or-url>
+```
+
+### List peers
+
+```bash
+node $MYR_HOME/bin/myr.js peers
+```
+
+### Manual sync (on demand)
+
+```bash
+node $MYR_HOME/bin/myr.js sync <peer-node-id>
+```
+
+Automatic sync runs every 15 minutes for all trusted peers once the server is running.
+
+### Mark reports as shareable
+
+Only reports explicitly marked `share_network=1` are served to peers. Mark your verified reports:
+
+```sql
+-- In your MYR database (db/myr.db)
+BEGIN IMMEDIATE;
+UPDATE myr_reports SET share_network=1
+WHERE node_id='<your-node-id>' AND operator_rating >= 3 AND verified_at IS NOT NULL;
+COMMIT;
+```
+
+---
+
+## Connecting to an Existing Peer (Full Flow)
+
+1. **Start your server** and confirm it's reachable at your `node_url`
+2. **Get peer's URL** — their Tailscale IP and port
+3. **Add them:** `node bin/myr.js add-peer <peer-url>`
+4. **Exchange fingerprints out-of-band** — call, Signal, in-person
+5. **Approve:** `node bin/myr.js approve-peer <peer-node-id>`
+6. **Ask peer to approve you** — they run the same steps from their side
+7. **Verify sync:** `node bin/myr.js sync <peer-node-id>` — should return reports
+8. **Mark your reports shareable** (see above) so peers can pull from you
+
+---
 
 ## Capturing Yield
 
@@ -116,13 +276,10 @@ Use before known-domain work, architecture decisions, and when asked "what do we
 
 ## Verification and Rating Policy
 
-- Rating scale is 1-5.
+- Rating scale is 1–5.
 - Only designated operators may assign final ratings.
-- A MYR is "network-eligible" only after at least 1 operator review.
-- Node join criterion: at least 10 MYRs and average operator rating >= 3.0 over the most recent 10 reviewed MYRs.
-- If ratings conflict by >=2 points, require a second operator review.
-
-Queue and review commands:
+- A MYR is "network-eligible" only after at least 1 operator review with rating ≥ 3.
+- Node join criterion: at least 10 MYRs, average operator rating ≥ 3.0 over the most recent 10 reviewed MYRs.
 
 ```bash
 node $MYR_HOME/scripts/myr-verify.js --queue
@@ -135,83 +292,48 @@ node $MYR_HOME/scripts/myr-verify.js --id ID --rating 4 --notes "..."
 node $MYR_HOME/scripts/myr-weekly.js [--week 2026-02-17] [--output report.md]
 ```
 
-## Cross-Node Operations
+## Manual Package Exchange (Alternative to Live Sync)
 
-### Export signed yield
+If live server sync is not available, export/import signed packages manually.
+
+### Export
 
 ```bash
 node $MYR_HOME/scripts/myr-export.js --all
 ```
 
-Produces signed JSON artifact in `$MYR_HOME/exports/` containing only eligible reviewed yield.
+Produces signed JSON in `$MYR_HOME/exports/`.
 
-### Import peer yield
-
-Import runs a preflight scan before touching the database. Two distinct errors:
-- **"You are importing your own artifacts"** — `node_id` and `node_uuid` both match your node. Exit 2.
-- **"Label collision between two different nodes"** — `node_id` matches but `node_uuid` differs. Peer must set a unique `node_id` and re-export. Exit 2.
-
-If the peer's public key is already registered and a new import presents a different key for the same `node_id`, import exits 3 with remediation. No silent key overwrite.
+### Import
 
 ```bash
-node $MYR_HOME/scripts/myr-import.js --file path.myr.json [--peer-key keys/n2.public.pem]
+node $MYR_HOME/scripts/myr-import.js --file path.myr.json [--peer-key keys/peer.public.pem]
 ```
 
-### Cross-node synthesis
+Import errors:
+- `"You are importing your own artifacts"` — node_id and node_uuid match your node. Exit 2.
+- `"Label collision between two different nodes"` — node_id matches but node_uuid differs. Peer must set a unique node_id and re-export. Exit 2.
+- Key mismatch: import exits 3 with remediation. No silent key overwrite.
+
+## Cross-Node Synthesis
 
 ```bash
 node $MYR_HOME/scripts/myr-synthesize.js --tags "domain" --min-nodes 2
 ```
 
-Identifies convergent findings, divergences, and unique contributions.
+Identifies convergent findings, divergences, and unique contributions across nodes.
 
 ## Signing and Trust Requirements
 
 - Every exported MYR bundle must include a detached signature and signer ID.
 - Import must fail closed on signature verification failure.
-- Record signer ID, verification timestamp, and source node on successful import.
 - Never merge unsigned or unverifiable MYRs into trusted datasets.
-
-## Joining the Network
-
-To become a peer in the Starfighter/Pistis network:
-1. Install and verify node
-2. Run `myr-identity.js` and exchange fingerprints out-of-band with your peer before touching packages
-3. Exchange public keys (`$MYR_HOME/keys/{node_id}.public.pem`)
-3. Produce real OODA yield (at least 10 MYRs with concrete evidence and explicit operational changes)
-4. Complete operator review cycle (average rating >=3.0 over the most recent 10 reviewed MYRs)
-5. Exchange signed artifacts and import peer artifacts
-
-## Proposed Sharing Workflow (v0.1)
-
-This is the current best-practice proposal for identifying and sharing yield across nodes. We have not yet fully field-tested this end-to-end at scale; treat as the current operating model and refine after prototype runs.
-
-1. **Generate local artifacts** during normal operations (logs, notes, commits, analyses).
-2. **Identify candidate yield**: select only learnings that are reusable outside the originating context.
-3. **Convert to MYRs** with explicit evidence and “what changes next” fields.
-4. **Filter for safety**: remove secrets, sensitive internals, PII, and context that should remain local.
-5. **Operator review**: rate quality and transferability; only eligible reviewed MYRs move forward.
-6. **Export signed bundle** (`myr-export --all`) and share artifact with peer plus key material as needed.
-7. **Peer import and verify** (`myr-import --file ... --peer-key ...`): fail closed on invalid signature, reject duplicates, record provenance.
-8. **Operationalize on receiving node**: make imported MYRs searchable and available for synthesis/decision support.
-
-### Selection Rule (What to Share)
-
-Share yield that is:
-- **Generalizable** (helps another node run better)
-- **Verified** (operator-reviewed, rating >=3)
-- **Safe** (no protected local data)
-
-Do not share raw internal ops artifacts when a distilled MYR captures the transferable method.
 
 ## Memory-System Integration (Async)
 
 - MYR capture must be fire-and-forget from the primary agent flow.
 - Do not block user response on MYR persistence.
 - On persistence failure, log the error and surface a non-fatal warning.
-- Include correlation ID so stored MYRs can be traced to source task/session.
-
-Reference implementation: `$MYR_HOME/docs/INTEGRATION-EXAMPLES.md`
 
 ## ID Format
 
@@ -219,6 +341,5 @@ Reference implementation: `$MYR_HOME/docs/INTEGRATION-EXAMPLES.md`
 
 ## Architecture
 
-For network protocol and scale roadmap (3 -> 300,000 nodes), see:
+For network protocol and scale roadmap, see:
 `$MYR_HOME/docs/NETWORK-ARCHITECTURE.md`
-
