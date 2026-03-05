@@ -245,11 +245,28 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     }
 
     const existing = db.prepare(
-      'SELECT id FROM myr_peers WHERE public_key = ?'
+      'SELECT trust_level FROM myr_peers WHERE public_key = ?'
     ).get(body.public_key);
+
     if (existing) {
+      if (existing.trust_level === 'trusted') {
+        // Known trusted peer re-announcing (e.g. after upgrade or IP change).
+        // Update their URL and confirm — no manual approval needed.
+        db.prepare(
+          'UPDATE myr_peers SET peer_url = ?, operator_name = ?, approved_at = ? WHERE public_key = ?'
+        ).run(body.peer_url, body.operator_name, new Date().toISOString(), body.public_key);
+
+        return res.json({
+          status: 'connected',
+          our_public_key: publicKeyHex,
+          message: 'Recognized trusted peer. Connection confirmed.',
+          approval_required: false,
+        });
+      }
+
+      // Exists but not yet trusted — already pending, nothing more to do.
       return errorResponse(res, 'peer_exists',
-        'Peer relationship already exists with this public_key');
+        'Peer relationship already exists with this public_key and is pending approval');
     }
 
     db.prepare(

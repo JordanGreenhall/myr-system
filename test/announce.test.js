@@ -272,7 +272,7 @@ describe('POST /myr/peers/announce', () => {
     }
   });
 
-  it('409 conflict when peer already exists', async () => {
+  it('409 conflict when pending peer re-announces', async () => {
     const body = makeAnnounceBody();
     const signed = signRequest({
       method: 'POST',
@@ -291,6 +291,49 @@ describe('POST /myr/peers/announce', () => {
 
     assert.equal(res.status, 409);
     assert.equal(res.body.error.code, 'peer_exists');
+  });
+
+  it('trusted peer re-announcing is auto-approved with updated URL', async () => {
+    const trustedKeys = generateKeypair();
+    const newUrl = 'https://trusted-peer-new-ip.myr.network';
+
+    // Seed a trusted peer into the DB directly
+    db.prepare(
+      `INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, approved_at)
+       VALUES (?, ?, ?, 'trusted', ?, ?)`
+    ).run('https://trusted-peer-old-ip.myr.network', 'trustedpeer',
+      trustedKeys.publicKey, new Date().toISOString(), new Date().toISOString());
+
+    const body = makeAnnounceBody({
+      public_key: trustedKeys.publicKey,
+      operator_name: 'trustedpeer',
+      peer_url: newUrl,
+    });
+    const signed = signRequest({
+      method: 'POST',
+      path: '/myr/peers/announce',
+      body,
+      privateKey: trustedKeys.privateKey,
+      publicKey: trustedKeys.publicKey,
+    });
+
+    const res = await request(port, {
+      method: 'POST',
+      path: '/myr/peers/announce',
+      headers: signed.headers,
+      body,
+    });
+
+    assert.equal(res.status, 200);
+    assert.equal(res.body.status, 'connected');
+    assert.equal(res.body.approval_required, false);
+    assert.ok(res.body.our_public_key, 'response should include our public key');
+
+    // URL should be updated in DB
+    const row = db.prepare('SELECT peer_url, trust_level FROM myr_peers WHERE public_key = ?')
+      .get(trustedKeys.publicKey);
+    assert.equal(row.peer_url, newUrl);
+    assert.equal(row.trust_level, 'trusted');
   });
 
   it('401 without auth headers', async () => {
