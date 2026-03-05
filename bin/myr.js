@@ -292,6 +292,65 @@ if (require.main === module) {
       }
     });
 
+  program.command('register').description('Output a registry entry for this node (to submit a PR)')
+    .action(() => {
+      try {
+        const nodeId = config.node_id;
+        const operator = config.operator_name || config.node_name || nodeId;
+        const nodeUrl = config.node_url || `http://localhost:${config.port || 3719}`;
+
+        if (!nodeId) {
+          console.error('ERROR: node_id not set in config.json');
+          process.exit(1);
+        }
+
+        // Read this node's public key PEM
+        const pubKeyPath = path.join(config.keys_path, `${nodeId}.public.pem`);
+        if (!require('fs').existsSync(pubKeyPath)) {
+          console.error(`ERROR: Public key not found: ${pubKeyPath}`);
+          console.error('Run `node scripts/myr-keygen.js` to generate a keypair.');
+          process.exit(1);
+        }
+
+        const pubKeyPem = require('fs').readFileSync(pubKeyPath, 'utf8').trim();
+        const registeredAt = new Date().toISOString();
+
+        const entry = {
+          node_id: nodeId,
+          operator,
+          url: nodeUrl,
+          public_key: pubKeyPem,
+          registered_at: registeredAt,
+        };
+
+        console.log(JSON.stringify(entry, null, 2));
+        console.log('');
+        console.log('To join the MYR network:');
+        console.log('  1. Fork https://github.com/JordanGreenhall/myr-system');
+        console.log('  2. Add the above JSON object to network/nodes.json');
+        console.log('  3. Open a Pull Request');
+        console.log('  4. Once merged, run: node bin/myr.js sync-registry');
+      } catch (err) {
+        console.error(err.message);
+        process.exit(1);
+      }
+    });
+
+  program.command('sync-registry').description('Fetch and apply the signed MYR node registry')
+    .action(async () => {
+      let db;
+      try {
+        db = getDb();
+        const { syncRegistry } = require('../scripts/myr-sync-registry');
+        await syncRegistry({ db });
+      } catch (err) {
+        console.error('ERROR:', err.message);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
   program.parse(process.argv);
 }
 

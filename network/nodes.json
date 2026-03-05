@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "signed_at": "2026-03-05T17:55:57.315Z",
+  "signature": "18e388d81489e91419e8a33b946f6aa7b3ca9aca9e1a5b481a93cf8d899ec176f32770bc9dfdf4157976281070f9f82ddd1d4663e20d446ec2e48da4d7f73206",
+  "nodes": [
+    {
+      "node_id": "n1",
+      "operator": "jordan",
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAec1CBwdwg1IyOVD2eMDeE/ioKndNFzaCT2j4DrCJhUA=\n-----END PUBLIC KEY-----",
+      "registered_at": "2026-03-05T17:55:57.315Z",
+      "url": "http://100.114.203.73:3719"
+    }
+  ]
+}

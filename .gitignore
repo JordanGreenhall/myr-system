@@ -1,5 +1,8 @@
 config.json
-keys/*.pem
+# Private keys (never commit)
+keys/*.private.pem
+# Test keypairs (not for production)
+keys/n2.public.pem
 db/myr.db
 db/myr.db-wal
 db/myr.db-shm
