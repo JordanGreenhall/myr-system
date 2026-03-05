@@ -9,6 +9,13 @@
       "public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAec1CBwdwg1IyOVD2eMDeE/ioKndNFzaCT2j4DrCJhUA=\n-----END PUBLIC KEY-----",
       "registered_at": "2026-03-05T17:55:57.315Z",
       "url": "http://100.114.203.73:3719"
+    },
+    {
+      "node_id": "tillerman",
+      "operator": "Tillerman \u2014 Jared / Eitan",
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAyorV9GtylzpFQDsMfCoYIb2KIcCIqqGNc0Z7MaH7Ikc=\n-----END PUBLIC KEY-----",
+      "registered_at": "2026-03-05T23:29:25.844Z",
+      "url": "https://jmac.taile19492.ts.net"
     }
   ]
 }
