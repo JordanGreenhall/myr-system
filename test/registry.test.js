@@ -159,22 +159,23 @@ describe('verifyRegistrySignature', () => {
 // ---------------------------------------------------------------------------
 
 describe('upsertPeer', () => {
-  it('inserts a new peer as pending', () => {
+  it('inserts a new peer as pending, storing key as hex', () => {
     const db = makeTestDb();
-    const { publicKeyPem } = makeTestKeypair();
+    const { publicKeyPem, publicKeyHex } = makeTestKeypair();
     const node = {
       node_id: 'n42',
       operator: 'alice',
       url: 'http://alice.example:3719',
-      public_key: publicKeyPem,
+      public_key: publicKeyPem, // registry provides PEM
       registered_at: new Date().toISOString(),
     };
 
     const inserted = upsertPeer(db, node);
     assert.ok(inserted);
 
-    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyPem);
-    assert.ok(row);
+    // DB must store hex (what auth middleware sends in X-MYR-Public-Key)
+    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyHex);
+    assert.ok(row, 'peer should be stored with hex key');
     assert.equal(row.trust_level, 'pending');
     assert.equal(row.operator_name, 'alice');
     assert.equal(row.peer_url, 'http://alice.example:3719');
@@ -182,7 +183,7 @@ describe('upsertPeer', () => {
 
   it('does not insert the same peer twice', () => {
     const db = makeTestDb();
-    const { publicKeyPem } = makeTestKeypair();
+    const { publicKeyPem, publicKeyHex } = makeTestKeypair();
     const node = {
       node_id: 'n43',
       operator: 'bob',
@@ -196,33 +197,33 @@ describe('upsertPeer', () => {
     assert.ok(first);
     assert.ok(!second);
 
-    const rows = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').all(publicKeyPem);
+    const rows = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').all(publicKeyHex);
     assert.equal(rows.length, 1);
   });
 
   it('does not downgrade a trusted peer', () => {
     const db = makeTestDb();
-    const { publicKeyPem } = makeTestKeypair();
+    const { publicKeyPem, publicKeyHex } = makeTestKeypair();
     const now = new Date().toISOString();
 
-    // Pre-insert as trusted
+    // Pre-insert as trusted using hex (matching real storage format)
     db.prepare(`
       INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at)
       VALUES (?, ?, ?, 'trusted', ?)
-    `).run('http://trusted.example:3719', 'carol', publicKeyPem, now);
+    `).run('http://trusted.example:3719', 'carol', publicKeyHex, now);
 
     const node = {
       node_id: 'n44',
       operator: 'carol',
       url: 'http://trusted.example:3719',
-      public_key: publicKeyPem,
+      public_key: publicKeyPem, // registry provides PEM
       registered_at: now,
     };
 
     const inserted = upsertPeer(db, node);
     assert.ok(!inserted); // already exists
 
-    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyPem);
+    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyHex);
     assert.equal(row.trust_level, 'trusted'); // still trusted
   });
 });
@@ -232,20 +233,22 @@ describe('upsertPeer', () => {
 // ---------------------------------------------------------------------------
 
 describe('applyRevocation', () => {
-  it('sets trust_level=rejected for a known peer', () => {
+  it('sets trust_level=rejected for a known peer (PEM input)', () => {
     const db = makeTestDb();
-    const { publicKeyPem } = makeTestKeypair();
+    const { publicKeyPem, publicKeyHex } = makeTestKeypair();
     const now = new Date().toISOString();
 
+    // DB stores hex (as upsertPeer would have stored it)
     db.prepare(`
       INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at)
       VALUES (?, ?, ?, 'trusted', ?)
-    `).run('http://badnode.example:3719', 'badactor', publicKeyPem, now);
+    `).run('http://badnode.example:3719', 'badactor', publicKeyHex, now);
 
+    // Revocation list may contain PEM — applyRevocation converts internally
     const applied = applyRevocation(db, { node_id: 'n-bad', public_key: publicKeyPem });
     assert.ok(applied);
 
-    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyPem);
+    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyHex);
     assert.equal(row.trust_level, 'rejected');
   });
 
@@ -259,18 +262,18 @@ describe('applyRevocation', () => {
 
   it('is idempotent for already-rejected peers', () => {
     const db = makeTestDb();
-    const { publicKeyPem } = makeTestKeypair();
+    const { publicKeyPem, publicKeyHex } = makeTestKeypair();
     const now = new Date().toISOString();
 
     db.prepare(`
       INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at)
       VALUES (?, ?, ?, 'rejected', ?)
-    `).run('http://rejected.example:3719', 'badactor', publicKeyPem, now);
+    `).run('http://rejected.example:3719', 'badactor', publicKeyHex, now);
 
     const applied = applyRevocation(db, { node_id: 'n-bad', public_key: publicKeyPem });
     assert.ok(!applied); // no change needed
 
-    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyPem);
+    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyHex);
     assert.equal(row.trust_level, 'rejected');
   });
 });
@@ -387,17 +390,17 @@ describe('syncRegistry', () => {
   it('applies revocations to existing peers', async () => {
     const db = makeTestDb();
     const kp = makeTestKeypair();
-    const { publicKeyPem } = makeTestKeypair();
+    const { publicKeyPem, publicKeyHex } = makeTestKeypair();
     const now = new Date().toISOString();
 
-    // Pre-insert a peer as trusted
+    // Pre-insert a peer as trusted using hex (real storage format)
     db.prepare(`
       INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at)
       VALUES (?, ?, ?, 'trusted', ?)
-    `).run('http://victim.example:3719', 'victim', publicKeyPem, now);
+    `).run('http://victim.example:3719', 'victim', publicKeyHex, now);
 
     const nodes = [];
-    const revoked = [{ node_id: 'n-victim', public_key: publicKeyPem }];
+    const revoked = [{ node_id: 'n-victim', public_key: publicKeyPem }]; // registry uses PEM
 
     const registry = makeNodesRegistry(kp, nodes, 1);
     const revocation = makeRevokedRegistry(kp, revoked, 1);
@@ -418,27 +421,27 @@ describe('syncRegistry', () => {
 
     assert.equal(summary.revocations, 1);
 
-    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyPem);
+    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyHex);
     assert.equal(row.trust_level, 'rejected');
   });
 
   it('does not downgrade trusted peers added by registry', async () => {
     const db = makeTestDb();
     const kp = makeTestKeypair();
-    const { publicKeyPem } = makeTestKeypair();
+    const { publicKeyPem, publicKeyHex } = makeTestKeypair();
     const now = new Date().toISOString();
 
-    // Pre-insert as trusted
+    // Pre-insert as trusted using hex (real storage format)
     db.prepare(`
       INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at)
       VALUES (?, ?, ?, 'trusted', ?)
-    `).run('http://trusted.example:3719', 'trustedguy', publicKeyPem, now);
+    `).run('http://trusted.example:3719', 'trustedguy', publicKeyHex, now);
 
     const nodes = [{
       node_id: 'n-trusted',
       operator: 'trustedguy',
       url: 'http://trusted.example:3719',
-      public_key: publicKeyPem,
+      public_key: publicKeyPem, // registry provides PEM
       registered_at: now,
     }];
 
@@ -461,7 +464,7 @@ describe('syncRegistry', () => {
 
     assert.equal(summary.newPeers, 0); // already existed
 
-    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyPem);
+    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyHex);
     assert.equal(row.trust_level, 'trusted'); // still trusted
   });
 });

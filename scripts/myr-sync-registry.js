@@ -116,17 +116,32 @@ function saveConfigRaw(cfg) {
  * - If peer exists but trust_level != 'trusted': leave it alone (don't downgrade trusted)
  * Returns true if a new peer was inserted.
  */
+/**
+ * Convert a PEM public key to the 32-byte raw hex format used by the auth
+ * middleware and stored in myr_peers.public_key. The auth layer sends and
+ * looks up keys as hex (X-MYR-Public-Key header), so all DB entries must
+ * match that format regardless of how the registry stores them.
+ */
+function pemToHex(pem) {
+  const keyObj = crypto.createPublicKey(pem);
+  const der = keyObj.export({ type: 'spki', format: 'der' });
+  // Last 32 bytes of SPKI DER are the raw Ed25519 public key
+  return der.slice(-32).toString('hex');
+}
+
 function upsertPeer(db, node) {
-  // public_key in the registry is PEM format; store as-is
-  // Check if peer already exists by public_key
-  const existing = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(node.public_key);
+  // Registry stores PEM; auth middleware uses hex — convert before storing
+  const publicKeyHex = pemToHex(node.public_key);
+
+  // Check if peer already exists by public_key (hex)
+  const existing = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(publicKeyHex);
 
   if (!existing) {
     const now = new Date().toISOString();
     db.prepare(`
       INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at)
       VALUES (?, ?, ?, 'pending', ?)
-    `).run(node.url, node.operator, node.public_key, now);
+    `).run(node.url, node.operator, publicKeyHex, now);
     return true;
   }
 
@@ -142,11 +157,19 @@ function applyRevocation(db, revokedEntry) {
   const key = revokedEntry.public_key;
   if (!key) return false;
 
-  const existing = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(key);
+  // Revocation list may contain PEM — convert to hex to match DB storage
+  let keyHex;
+  try {
+    keyHex = key.includes('BEGIN') ? pemToHex(key) : key;
+  } catch {
+    return false; // malformed key, skip
+  }
+
+  const existing = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(keyHex);
   if (!existing) return false;
   if (existing.trust_level === 'rejected') return false;
 
-  db.prepare("UPDATE myr_peers SET trust_level = 'rejected' WHERE public_key = ?").run(key);
+  db.prepare("UPDATE myr_peers SET trust_level = 'rejected' WHERE public_key = ?").run(keyHex);
   return true;
 }
 
