@@ -1,7 +1,7 @@
 {
-  "version": 3,
-  "signed_at": "2026-03-06T01:51:58.942Z",
-  "signature": "6c02be0c3430fc330685673615779c2d855296c01e31c3c32c1663e8066c6007fddfbcf3deb873709f9c447c515d90dd9aae9397139051c27f8fcacbbf68ca08",
+  "version": 4,
+  "signed_at": "2026-03-06T01:52:14.912Z",
+  "signature": "72a4974e1584967674684483da225fdd0105e26783000a12b6781994f973908afa88b9b257694d995b2c5c4d830524109e8f69fea5584d567f2bdd74e26b5500",
   "nodes": [
     {
       "node_id": "n1",
@@ -16,6 +16,13 @@
       "url": "https://garys-macbook-pro-2.taila359c0.ts.net",
       "public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAHHvF94ucpHvsILoCzAsBo8wObI5JY/78QYFJVPUw6u4=\n-----END PUBLIC KEY-----",
       "registered_at": "2026-03-05T19:08:35.573Z"
+    },
+    {
+      "node_id": "tillerman",
+      "operator": "Tillerman — Jared / Eitan",
+      "url": "https://jmac.taile19492.ts.net",
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAyorV9GtylzpFQDsMfCoYIb2KIcCIqqGNc0Z7MaH7Ikc=\n-----END PUBLIC KEY-----",
+      "registered_at": "2026-03-05T23:29:25.844Z"
     }
   ]
 }
