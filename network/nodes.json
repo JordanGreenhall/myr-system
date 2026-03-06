@@ -1,7 +1,7 @@
 {
-  "version": 2,
-  "signed_at": "2026-03-06T00:59:29.927Z",
-  "signature": "4521f60ba14efb9ad245fb846c4a96de8759deb26421432dd049f6bcca689179a867b4f2cf200c5dce9f47804a00381b7c44428eff4b83fff5605aa3dc6b110b",
+  "version": 3,
+  "signed_at": "2026-03-06T01:51:58.942Z",
+  "signature": "6c02be0c3430fc330685673615779c2d855296c01e31c3c32c1663e8066c6007fddfbcf3deb873709f9c447c515d90dd9aae9397139051c27f8fcacbbf68ca08",
   "nodes": [
     {
       "node_id": "n1",
