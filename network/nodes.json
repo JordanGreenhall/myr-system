@@ -9,6 +9,13 @@
       "public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAec1CBwdwg1IyOVD2eMDeE/ioKndNFzaCT2j4DrCJhUA=\n-----END PUBLIC KEY-----",
       "registered_at": "2026-03-05T17:55:57.315Z",
       "url": "http://100.114.203.73:3719"
+    },
+    {
+      "node_id": "n3",
+      "operator": "Gary Sheng",
+      "url": "https://garys-macbook-pro-2.taila359c0.ts.net",
+      "public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAHHvF94ucpHvsILoCzAsBo8wObI5JY/78QYFJVPUw6u4=\n-----END PUBLIC KEY-----",
+      "registered_at": "2026-03-05T19:08:35.573Z"
     }
   ]
 }
