@@ -41,6 +41,43 @@ function safeCount(db, sql) {
 }
 
 /**
+ * Convert a PEM public key to the 32-byte Ed25519 raw key as hex.
+ * Matches the format used by all MYR clients.
+ */
+function pemToHex(pem) {
+  const keyObj = crypto.createPublicKey(pem);
+  const der = keyObj.export({ type: 'spki', format: 'der' });
+  return der.slice(-32).toString('hex');
+}
+
+/**
+ * Load network/nodes.json and return a Map of hex public key → node entry.
+ * Returns an empty Map if the registry cannot be read.
+ */
+function loadRegistry(config) {
+  try {
+    const registryPath = path.join(
+      path.dirname(require.resolve('../scripts/config')),
+      '..',
+      'network',
+      'nodes.json'
+    );
+    const registry = JSON.parse(fs.readFileSync(registryPath, 'utf8'));
+    const map = new Map();
+    for (const node of (registry.nodes || [])) {
+      if (node.public_key) {
+        try {
+          map.set(pemToHex(node.public_key), node);
+        } catch { /* skip malformed entries */ }
+      }
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+/**
  * Create the Express app. Accepts explicit publicKeyHex/createdAt for testing,
  * otherwise loads from the filesystem using config.keys_path and config.node_id.
  */
@@ -244,40 +281,39 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         'public_key in body does not match X-MYR-Public-Key header');
     }
 
-    const existing = db.prepare(
-      'SELECT trust_level FROM myr_peers WHERE public_key = ?'
-    ).get(body.public_key);
+    const peerKey = body.public_key; // hex
 
-    if (existing) {
-      if (existing.trust_level === 'trusted') {
-        // Known trusted peer re-announcing (e.g. after upgrade or IP change).
-        // Update their URL and confirm — no manual approval needed.
-        db.prepare(
-          'UPDATE myr_peers SET peer_url = ?, operator_name = ?, approved_at = ? WHERE public_key = ?'
-        ).run(body.peer_url, body.operator_name, new Date().toISOString(), body.public_key);
+    // Check the signed registry — registry membership IS approval.
+    const registry = loadRegistry(config);
+    const registryNode = registry.get(peerKey);
 
-        return res.json({
-          status: 'connected',
-          our_public_key: publicKeyHex,
-          message: 'Recognized trusted peer. Connection confirmed.',
-          approval_required: false,
-        });
-      }
-
-      // Exists but not yet trusted — already pending, nothing more to do.
-      return errorResponse(res, 'peer_exists',
-        'Peer relationship already exists with this public_key and is pending approval');
+    if (!registryNode) {
+      return errorResponse(res, 'forbidden',
+        'Public key not found in signed node registry. Contact the operator to be added.');
     }
 
-    db.prepare(
-      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
-    ).run(body.peer_url, body.operator_name, body.public_key, 'pending', new Date().toISOString());
+    const now = new Date().toISOString();
+    const existing = db.prepare(
+      'SELECT trust_level FROM myr_peers WHERE public_key = ?'
+    ).get(peerKey);
 
-    res.json({
-      status: 'pending_approval',
+    if (existing) {
+      // Already in DB — update URL and ensure trusted (handles pending→trusted upgrade too).
+      db.prepare(
+        'UPDATE myr_peers SET peer_url = ?, operator_name = ?, trust_level = ?, approved_at = ? WHERE public_key = ?'
+      ).run(body.peer_url, body.operator_name, 'trusted', now, peerKey);
+    } else {
+      // First announce — auto-trust because they're in the signed registry.
+      db.prepare(
+        'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, approved_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run(body.peer_url, body.operator_name, peerKey, 'trusted', now, now);
+    }
+
+    return res.json({
+      status: 'connected',
       our_public_key: publicKeyHex,
-      message: 'Peer request received. Awaiting operator approval.',
-      approval_required: true,
+      message: 'Registry member recognized. Connection confirmed.',
+      approval_required: false,
     });
   });
 
