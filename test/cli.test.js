@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 const Database = require('better-sqlite3');
 const { createApp } = require('../server/index');
 const { generateKeypair, fingerprint: computeFingerprint } = require('../lib/crypto');
+const crypto = require('crypto');
+const { sign } = require('../lib/crypto');
 const {
   findPeer,
   addPeer,
@@ -14,6 +16,7 @@ const {
   getFingerprint,
   getPeerFingerprint,
   syncPeer,
+  nodeVerify,
 } = require('../bin/myr');
 
 function createTestDb() {
@@ -438,5 +441,135 @@ describe('syncPeer', () => {
       () => syncPeer({ db: cliDb, peerName: 'nonexistent', keys: ourKeys }),
       /No peer found/
     );
+  });
+});
+
+// ---------- nodeVerify ----------
+
+describe('nodeVerify', () => {
+  it('happy path: mock discovery and health, verify succeeds', async () => {
+    const keys = generateKeypair();
+    const timestamp = new Date().toISOString();
+    const nonce = crypto.randomBytes(32).toString('hex');
+    const signature = sign(timestamp + nonce, keys.privateKey);
+
+    const mockFetch = async (url) => {
+      if (url.includes('/.well-known/myr-node')) {
+        return {
+          public_key: keys.publicKey,
+          operator_name: 'mock-operator',
+          fingerprint: computeFingerprint(keys.publicKey),
+        };
+      }
+      if (url.includes('/myr/health')) {
+        return {
+          status: 'ok',
+          liveness_proof: { timestamp, nonce, signature },
+        };
+      }
+    };
+
+    const result = await nodeVerify({
+      url: 'http://mock.node:3719',
+      fetchFn: mockFetch,
+    });
+    assert.equal(result.verified, true);
+    assert.equal(result.operator_name, 'mock-operator');
+    assert.ok(result.fingerprint);
+    assert.ok(result.latency_ms >= 0);
+  });
+
+  it('unreachable node: returns verified:false with reason', async () => {
+    const mockFetch = async () => {
+      const err = new Error('connection refused');
+      err.code = 'ECONNREFUSED';
+      throw err;
+    };
+
+    const result = await nodeVerify({
+      url: 'http://dead.node:3719',
+      fetchFn: mockFetch,
+    });
+    assert.equal(result.verified, false);
+    assert.ok(result.reason.includes('Could not reach'));
+  });
+
+  it('missing liveness_proof: returns pre-1.5 message', async () => {
+    const keys = generateKeypair();
+    const mockFetch = async (url) => {
+      if (url.includes('/.well-known/myr-node')) {
+        return {
+          public_key: keys.publicKey,
+          operator_name: 'oldnode',
+          fingerprint: computeFingerprint(keys.publicKey),
+        };
+      }
+      return { status: 'ok' }; // no liveness_proof
+    };
+
+    const result = await nodeVerify({
+      url: 'http://old.node:3719',
+      fetchFn: mockFetch,
+    });
+    assert.equal(result.verified, false);
+    assert.ok(result.reason.includes('pre-1.5'));
+  });
+
+  it('bad signature: returns signature failure reason', async () => {
+    const keys = generateKeypair();
+    const otherKeys = generateKeypair();
+    const timestamp = new Date().toISOString();
+    const nonce = crypto.randomBytes(32).toString('hex');
+    // Sign with wrong key
+    const signature = sign(timestamp + nonce, otherKeys.privateKey);
+
+    const mockFetch = async (url) => {
+      if (url.includes('/.well-known/myr-node')) {
+        return {
+          public_key: keys.publicKey,
+          operator_name: 'bad-node',
+          fingerprint: computeFingerprint(keys.publicKey),
+        };
+      }
+      return {
+        status: 'ok',
+        liveness_proof: { timestamp, nonce, signature },
+      };
+    };
+
+    const result = await nodeVerify({
+      url: 'http://bad.node:3719',
+      fetchFn: mockFetch,
+    });
+    assert.equal(result.verified, false);
+    assert.ok(result.reason.includes('Signature verification failed'));
+  });
+
+  it('stale timestamp: returns stale message', async () => {
+    const keys = generateKeypair();
+    const staleTime = new Date(Date.now() - 6 * 60 * 1000).toISOString();
+    const nonce = crypto.randomBytes(32).toString('hex');
+    const signature = sign(staleTime + nonce, keys.privateKey);
+
+    const mockFetch = async (url) => {
+      if (url.includes('/.well-known/myr-node')) {
+        return {
+          public_key: keys.publicKey,
+          operator_name: 'stale-node',
+          fingerprint: computeFingerprint(keys.publicKey),
+        };
+      }
+      return {
+        status: 'ok',
+        liveness_proof: { timestamp: staleTime, nonce, signature },
+      };
+    };
+
+    const result = await nodeVerify({
+      url: 'http://stale.node:3719',
+      fetchFn: mockFetch,
+    });
+    assert.equal(result.verified, false);
+    assert.ok(result.reason.includes('stale'), `Expected 'stale' in reason, got: ${result.reason}`);
   });
 });
