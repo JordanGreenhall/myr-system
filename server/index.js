@@ -9,6 +9,7 @@ const { createAuthMiddleware } = require('./middleware/auth');
 const { createRateLimiter } = require('./middleware/rate-limit');
 const { canonicalize } = require('../lib/canonicalize');
 const { sign: signMessage, fingerprint: computeFingerprint } = require('../lib/crypto');
+const { verifyLivenessProof, verifyNode } = require('../lib/liveness');
 
 function loadPublicKeyHex(keysPath, nodeId) {
   const publicKeyPath = path.join(keysPath, `${nodeId}.public.pem`);
@@ -193,6 +194,15 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       };
       if (livenessSignature) response.liveness_signature = livenessSignature;
 
+      // MYR 1.5: structured liveness_proof block
+      if (livenessSignature) {
+        response.liveness_proof = {
+          timestamp: livenessTimestamp,
+          nonce: livenessNonce,
+          signature: livenessSignature,
+        };
+      }
+
       res.json(response);
     } catch (err) {
       return errorResponse(res, 'internal_error',
@@ -298,6 +308,74 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
   app.get('/myr/peer/list', (req, res) => {
     const peers = db.prepare('SELECT * FROM myr_peers ORDER BY added_at DESC').all();
     return res.json({ peers });
+  });
+
+  // --- Health verify endpoint (auth required) ---
+  // MYR 1.5: verify liveness proof of self or a target peer
+  app.get('/myr/health/verify', async (req, res) => {
+    try {
+      const targetFingerprint = req.query.fingerprint || null;
+
+      if (!targetFingerprint) {
+        // Verify self: check our own liveness_proof inline (no network call)
+        if (!privateKeyHex || !publicKeyHex) {
+          return errorResponse(res, 'internal_error',
+            'Cannot verify self — missing keypair');
+        }
+        const timestamp = new Date().toISOString();
+        const nonce = crypto.randomBytes(32).toString('hex');
+        const signature = signMessage(timestamp + nonce, privateKeyHex);
+
+        const result = verifyLivenessProof(
+          { timestamp, nonce, signature },
+          publicKeyHex,
+        );
+
+        return res.json({
+          verified: result.verified,
+          fingerprint: computeFingerprint(publicKeyHex),
+          operator_name: operatorName,
+          latency_ms: 0,
+          timestamp,
+          ...(result.reason ? { reason: result.reason } : {}),
+        });
+      }
+
+      // Verify a peer: look up by fingerprint in myr_peers
+      const peers = db.prepare('SELECT * FROM myr_peers').all();
+      let targetPeer = null;
+      for (const peer of peers) {
+        const peerFp = computeFingerprint(peer.public_key);
+        if (peerFp === targetFingerprint || peer.public_key.startsWith(targetFingerprint)) {
+          targetPeer = peer;
+          break;
+        }
+      }
+
+      if (!targetPeer) {
+        return errorResponse(res, 'peer_not_found',
+          `No peer found with fingerprint ${targetFingerprint}`);
+      }
+
+      if (!targetPeer.peer_url) {
+        return errorResponse(res, 'invalid_request',
+          'Peer has no node_url configured — cannot verify remotely');
+      }
+
+      const result = await verifyNode(targetPeer.peer_url);
+
+      return res.json({
+        verified: result.verified,
+        fingerprint: result.fingerprint || targetFingerprint,
+        operator_name: result.operator_name || targetPeer.operator_name,
+        ...(result.latency_ms != null ? { latency_ms: result.latency_ms } : {}),
+        ...(result.timestamp ? { timestamp: result.timestamp } : {}),
+        ...(result.reason ? { reason: result.reason } : {}),
+      });
+    } catch (err) {
+      return errorResponse(res, 'internal_error',
+        'Failed to verify liveness', err.message);
+    }
   });
 
   // --- Reports listing endpoint (auth required, trusted peers only) ---
