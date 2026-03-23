@@ -50,7 +50,7 @@ function createTestDb() {
       peer_url TEXT UNIQUE NOT NULL,
       operator_name TEXT NOT NULL,
       public_key TEXT UNIQUE NOT NULL,
-      trust_level TEXT CHECK(trust_level IN ('trusted', 'pending', 'rejected')) DEFAULT 'pending',
+      trust_level TEXT CHECK(trust_level IN ('trusted', 'pending', 'introduced', 'revoked', 'rejected')) DEFAULT 'pending',
       added_at TEXT NOT NULL,
       approved_at TEXT,
       last_sync_at TEXT,
@@ -141,12 +141,12 @@ describe('GET /.well-known/myr-node', () => {
   it('returns 200 with correct JSON structure', async () => {
     const { status, body } = await get(port, '/.well-known/myr-node');
     assert.equal(status, 200);
-    assert.equal(body.protocol_version, '0.3.0');
+    assert.equal(body.protocol_version, '1.0.0');
     assert.equal(body.node_url, 'https://test.myr.network');
     assert.equal(body.operator_name, 'testoperator');
     assert.equal(body.public_key, TEST_PUBLIC_KEY);
     assert.equal(body.public_key.length, 64);
-    assert.deepEqual(body.supported_features,
+    assert.deepEqual(body.capabilities,
       ['report-sync', 'peer-discovery', 'incremental-sync']);
     assert.equal(body.created_at, TEST_CREATED_AT);
     assert.equal(body.rate_limits.requests_per_minute, 60);
@@ -157,7 +157,7 @@ describe('GET /.well-known/myr-node', () => {
     const { body } = await get(port, '/.well-known/myr-node');
     const required = [
       'protocol_version', 'node_url', 'operator_name', 'public_key',
-      'supported_features', 'created_at', 'rate_limits',
+      'capabilities', 'created_at', 'rate_limits',
     ];
     for (const field of required) {
       assert.ok(field in body, `missing field: ${field}`);

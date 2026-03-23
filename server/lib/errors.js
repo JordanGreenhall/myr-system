@@ -10,6 +10,7 @@ const STATUS_CODES = {
   invalid_request: 400,
   key_mismatch: 400,
   conflict: 409,
+  peer_not_found: 404,
   peer_exists: 409,
   rate_limit_exceeded: 429,
   report_not_found: 404,

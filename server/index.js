@@ -6,8 +6,9 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { errorResponse } = require('./lib/errors');
 const { createAuthMiddleware } = require('./middleware/auth');
+const { createRateLimiter } = require('./middleware/rate-limit');
 const { canonicalize } = require('../lib/canonicalize');
-const { sign: signMessage } = require('../lib/crypto');
+const { sign: signMessage, fingerprint: computeFingerprint } = require('../lib/crypto');
 
 function loadPublicKeyHex(keysPath, nodeId) {
   const publicKeyPath = path.join(keysPath, `${nodeId}.public.pem`);
@@ -127,11 +128,12 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     }
 
     res.json({
-      protocol_version: '0.3.0',
+      protocol_version: '1.0.0',
       node_url: nodeUrl,
       operator_name: operatorName,
       public_key: publicKeyHex,
-      supported_features: ['report-sync', 'peer-discovery', 'incremental-sync'],
+      fingerprint: computeFingerprint(publicKeyHex),
+      capabilities: ['report-sync', 'peer-discovery', 'incremental-sync'],
       created_at: createdAt,
       rate_limits: {
         requests_per_minute: 60,
@@ -167,43 +169,140 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
 
       const uptimeSeconds = Math.floor((Date.now() - startedAt) / 1000);
 
-      res.json({
+      // Signed liveness proof: sign timestamp+nonce with our private key
+      const livenessTimestamp = new Date().toISOString();
+      const livenessNonce = crypto.randomBytes(32).toString('hex');
+      let livenessSignature = null;
+      if (privateKeyHex) {
+        livenessSignature = signMessage(livenessTimestamp + livenessNonce, privateKeyHex);
+      }
+
+      const response = {
         status: 'ok',
         node_url: nodeUrl,
         operator_name: operatorName,
+        public_key: publicKeyHex,
+        timestamp: livenessTimestamp,
+        nonce: livenessNonce,
         last_sync_at: lastSyncAt,
         peers_active: peersActive,
         peers_total: peersTotal,
         reports_total: reportsTotal,
-        reports_shared: reportsShared,
+        reports_shared: safeCount(db, 'SELECT COUNT(*) FROM myr_reports WHERE share_network=1'),
         uptime_seconds: uptimeSeconds,
-      });
+      };
+      if (livenessSignature) response.liveness_signature = livenessSignature;
+
+      res.json(response);
     } catch (err) {
       return errorResponse(res, 'internal_error',
         'Failed to query node status', err.message);
     }
   });
 
+  // --- Peer introduce endpoint (PUBLIC — no auth required) ---
+  // MYR v1.0 protocol: POST /myr/peer/introduce
+  // Receives an identity document, creates a pending peer record, returns our identity.
+  app.post('/myr/peer/introduce', (req, res) => {
+    const body = req.body || {};
+    const { identity_document } = body;
+
+    if (!identity_document) {
+      return errorResponse(res, 'invalid_request', 'Missing identity_document in request body');
+    }
+
+    const { public_key, operator_name, node_url } = identity_document;
+
+    if (!public_key || !operator_name) {
+      return errorResponse(res, 'invalid_request',
+        'identity_document must include public_key and operator_name');
+    }
+
+    const now = new Date().toISOString();
+    const existing = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(public_key);
+
+    if (!existing) {
+      try {
+        db.prepare(
+          'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+        ).run(node_url || '', operator_name, public_key, 'introduced', now);
+      } catch (err) {
+        return errorResponse(res, 'internal_error', 'Failed to store peer', err.message);
+      }
+    }
+
+    const ourIdentity = publicKeyHex ? {
+      protocol_version: '1.0.0',
+      public_key: publicKeyHex,
+      fingerprint: computeFingerprint(publicKeyHex),
+      operator_name: operatorName,
+      node_url: nodeUrl,
+      capabilities: ['report-sync', 'peer-discovery', 'incremental-sync'],
+      created_at: createdAt,
+    } : null;
+
+    return res.json({
+      status: 'introduced',
+      our_identity: ourIdentity,
+      trust_level: 'introduced',
+      message: 'Introduction received. Mutual approval required before sync is enabled.',
+    });
+  });
+
   // Auth middleware for all subsequent (protected) routes
   app.use(createAuthMiddleware(db));
 
+  // Rate limiter: 60 req/min per peer (by public key)
+  app.use(createRateLimiter({
+    windowMs: 60 * 1000,
+    maxRequests: config.rate_limit?.requests_per_minute || 60,
+  }));
+
+  // --- Peer approve endpoint (auth required — local operator key only) ---
+  app.post('/myr/peer/approve', (req, res) => {
+    // Only the local operator (holding the private key) may approve peers
+    if (publicKeyHex && req.auth.publicKey !== publicKeyHex) {
+      return errorResponse(res, 'forbidden',
+        'Only the local node operator may approve peers');
+    }
+
+    const { peer_fingerprint, trust_level = 'trusted' } = req.body || {};
+    if (!peer_fingerprint) {
+      return errorResponse(res, 'invalid_request', 'Missing peer_fingerprint');
+    }
+
+    // Find peer by fingerprint or public_key prefix
+    const rows = db.prepare('SELECT * FROM myr_peers').all();
+    let found = null;
+    for (const row of rows) {
+      if (computeFingerprint(row.public_key) === peer_fingerprint ||
+          row.public_key.startsWith(peer_fingerprint)) {
+        found = row;
+        break;
+      }
+    }
+
+    if (!found) {
+      return errorResponse(res, 'peer_not_found',
+        `No peer found with fingerprint ${peer_fingerprint}`);
+    }
+
+    db.prepare('UPDATE myr_peers SET trust_level = ?, approved_at = ? WHERE public_key = ?')
+      .run(trust_level, new Date().toISOString(), found.public_key);
+
+    const updated = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(found.public_key);
+    return res.json({ status: 'approved', peer: updated });
+  });
+
+  // --- Peer list endpoint (auth required) ---
+  app.get('/myr/peer/list', (req, res) => {
+    const peers = db.prepare('SELECT * FROM myr_peers ORDER BY added_at DESC').all();
+    return res.json({ peers });
+  });
+
   // --- Reports listing endpoint (auth required, trusted peers only) ---
   app.get('/myr/reports', (req, res) => {
-    const publicKey = req.auth.publicKey;
-
-    const peer = db.prepare(
-      'SELECT trust_level FROM myr_peers WHERE public_key = ?'
-    ).get(publicKey);
-
-    if (!peer) {
-      return errorResponse(res, 'unknown_peer',
-        'Your public key is not in our peer list');
-    }
-
-    if (peer.trust_level !== 'trusted') {
-      return errorResponse(res, 'peer_not_trusted',
-        "Peer relationship exists but trust_level != 'trusted'");
-    }
+    if (!requireTrustedPeer(req, res)) return;
 
     const since = req.query.since || null;
     let limit = 100;
@@ -258,10 +357,14 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       };
     });
 
+    // sync_cursor: the created_at of the last returned report (use as 'since' for next call)
+    const syncCursor = rows.length > 0 ? rows[rows.length - 1].created_at : (since || null);
+
     res.json({
       reports,
       total,
       since,
+      sync_cursor: syncCursor,
     });
   });
 
@@ -317,23 +420,32 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     });
   });
 
-  // --- Report fetch endpoint (auth required, trusted peers only) ---
-  app.get('/myr/reports/:signature', (req, res) => {
+  // --- Helper: check peer is trusted ---
+  function requireTrustedPeer(req, res) {
     const publicKey = req.auth.publicKey;
-
     const peer = db.prepare(
       'SELECT trust_level FROM myr_peers WHERE public_key = ?'
     ).get(publicKey);
 
     if (!peer) {
-      return errorResponse(res, 'unknown_peer',
-        'Your public key is not in our peer list');
+      errorResponse(res, 'unknown_peer', 'Your public key is not in our peer list');
+      return null;
     }
-
+    if (peer.trust_level === 'revoked') {
+      errorResponse(res, 'forbidden', 'Peer relationship has been revoked');
+      return null;
+    }
     if (peer.trust_level !== 'trusted') {
-      return errorResponse(res, 'peer_not_trusted',
+      errorResponse(res, 'peer_not_trusted',
         "Peer relationship exists but trust_level != 'trusted'");
+      return null;
     }
+    return peer;
+  }
+
+  // --- Report fetch endpoint (auth required, trusted peers only) ---
+  app.get('/myr/reports/:signature', (req, res) => {
+    if (!requireTrustedPeer(req, res)) return;
 
     const requestedSig = req.params.signature;
     const rows = db.prepare('SELECT * FROM myr_reports').all();
@@ -366,6 +478,23 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         'Report exists but share_network=false');
     }
 
+    // Verify the report's embedded Ed25519 signature before serving (if present).
+    // Per spec: "Never serve a report that fails its own signature verification."
+    if (matchedRow.signed_by && matchedRow.signed_artifact) {
+      const { verify: verifyEd25519 } = require('../lib/crypto');
+      const reportCopy = { ...matchedRow };
+      delete reportCopy.signature;
+      delete reportCopy.operator_signature;
+      const canonical = canonicalize(reportCopy);
+      // signed_artifact may be an Ed25519 sig or a sha256 hash; verify if it's an Ed25519 sig
+      if (matchedRow.signed_by.length === 64 && matchedRow.signed_artifact.length === 128) {
+        if (!verifyEd25519(canonical, matchedRow.signed_artifact, matchedRow.signed_by)) {
+          return errorResponse(res, 'internal_error',
+            'Report failed internal signature verification');
+        }
+      }
+    }
+
     const report = { ...matchedRow, signature: computedSig };
     const responseBody = JSON.stringify(report);
 
@@ -376,6 +505,47 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
 
     res.set('Content-Type', 'application/json');
     res.send(responseBody);
+  });
+
+  // --- Sync pull endpoint (auth required, trusted peers only) ---
+  // POST /myr/sync/pull — Trigger async pull from requesting peer
+  app.post('/myr/sync/pull', (req, res) => {
+    if (!requireTrustedPeer(req, res)) return;
+
+    const { since } = req.body || {};
+    if (since && isNaN(new Date(since).getTime())) {
+      return errorResponse(res, 'invalid_request',
+        'Invalid since parameter: must be ISO8601 timestamp');
+    }
+
+    // Count estimated reports available from the requesting peer
+    const peerPublicKey = req.auth.publicKey;
+    const peerRow = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(peerPublicKey);
+
+    // Generate a sync ID for tracking
+    const syncId = crypto.randomUUID();
+
+    // Estimate reports count from our shared reports (the peer will pull these)
+    let estimatedReports = 0;
+    if (since) {
+      estimatedReports = db.prepare(
+        'SELECT COUNT(*) as cnt FROM myr_reports WHERE share_network = 1 AND created_at > ?'
+      ).get(since).cnt;
+    } else {
+      estimatedReports = db.prepare(
+        'SELECT COUNT(*) as cnt FROM myr_reports WHERE share_network = 1'
+      ).get().cnt;
+    }
+
+    // Update peer's last_sync_at to track this pull request
+    db.prepare('UPDATE myr_peers SET last_sync_at = ? WHERE public_key = ?')
+      .run(new Date().toISOString(), peerPublicKey);
+
+    res.json({
+      sync_id: syncId,
+      status: 'started',
+      estimated_reports: estimatedReports,
+    });
   });
 
   return app;
