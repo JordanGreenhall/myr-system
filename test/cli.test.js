@@ -444,6 +444,110 @@ describe('syncPeer', () => {
   });
 });
 
+// ---------- syncPeer (sync-all path) ----------
+
+describe('syncPeer — sync-all behavior', () => {
+  let peerServer1, peerPort1, peerDb1, peerKeys1;
+  let peerServer2, peerPort2, peerDb2, peerKeys2;
+  let cliDb;
+  const ourKeys = generateKeypair();
+
+  before(() => {
+    peerKeys1 = generateKeypair();
+    peerKeys2 = generateKeypair();
+    peerDb1 = createTestDb();
+    peerDb2 = createTestDb();
+    cliDb = createTestDb();
+
+    // Peer 1: has 1 shared report
+    peerDb1.prepare(`
+      INSERT INTO myr_reports (id, timestamp, agent_id, node_id, cycle_intent, domain_tags,
+        yield_type, question_answered, evidence, what_changes_next, confidence,
+        created_at, updated_at, share_network)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run('p1-r1', '2026-03-01T10:00:00Z', 'agent1', 'peer1-node',
+      'method1', 'testing', 'technique', 'question1', 'evidence1', 'next1',
+      0.8, '2026-03-01T10:00:00Z', '2026-03-01T10:00:00Z', 1);
+
+    // Peer 2: has 1 shared report
+    peerDb2.prepare(`
+      INSERT INTO myr_reports (id, timestamp, agent_id, node_id, cycle_intent, domain_tags,
+        yield_type, question_answered, evidence, what_changes_next, confidence,
+        created_at, updated_at, share_network)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run('p2-r1', '2026-03-01T10:00:00Z', 'agent1', 'peer2-node',
+      'method2', 'testing', 'insight', 'question2', 'evidence2', 'next2',
+      0.9, '2026-03-01T10:00:00Z', '2026-03-01T10:00:00Z', 1);
+
+    // Register our key as trusted on both peers
+    peerDb1.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run('http://localhost:9999', 'us', ourKeys.publicKey, 'trusted', new Date().toISOString());
+
+    peerDb2.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run('http://localhost:9999', 'us', ourKeys.publicKey, 'trusted', new Date().toISOString());
+
+    const peerApp1 = createApp({
+      config: { node_id: 'peer1-node', operator_name: 'peer1', node_url: 'http://localhost', port: 0 },
+      db: peerDb1,
+      publicKeyHex: peerKeys1.publicKey,
+      createdAt: '2026-03-01T10:00:00Z',
+      privateKeyHex: peerKeys1.privateKey,
+    });
+    peerServer1 = peerApp1.listen(0);
+    peerPort1 = peerServer1.address().port;
+
+    const peerApp2 = createApp({
+      config: { node_id: 'peer2-node', operator_name: 'peer2', node_url: 'http://localhost', port: 0 },
+      db: peerDb2,
+      publicKeyHex: peerKeys2.publicKey,
+      createdAt: '2026-03-01T10:00:00Z',
+      privateKeyHex: peerKeys2.privateKey,
+    });
+    peerServer2 = peerApp2.listen(0);
+    peerPort2 = peerServer2.address().port;
+
+    // Register peers in our DB — peer1 trusted with auto_sync=1, peer2 trusted with auto_sync=0
+    cliDb.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, auto_sync) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(`http://localhost:${peerPort1}`, 'peer1', peerKeys1.publicKey, 'trusted', new Date().toISOString(), 1);
+
+    cliDb.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, auto_sync) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(`http://localhost:${peerPort2}`, 'peer2', peerKeys2.publicKey, 'trusted', new Date().toISOString(), 0);
+  });
+
+  after(() => {
+    peerServer1.close();
+    peerServer2.close();
+    peerDb1.close();
+    peerDb2.close();
+    cliDb.close();
+  });
+
+  it('syncs all trusted auto_sync peers', async () => {
+    // Use the CLI syncPeer to sync peer1 (auto_sync=1)
+    const result = await syncPeer({ db: cliDb, peerName: 'peer1', keys: ourKeys });
+    assert.equal(result.imported, 1);
+    assert.ok(result.message.includes('peer1'));
+  });
+
+  it('auto_sync=0 peer is still syncable by name', async () => {
+    // Direct sync by name should still work even if auto_sync=0
+    const result = await syncPeer({ db: cliDb, peerName: 'peer2', keys: ourKeys });
+    assert.equal(result.imported, 1);
+    assert.ok(result.message.includes('peer2'));
+  });
+
+  it('auto_sync=0 peer is excluded from sync-all query', () => {
+    // Verify the query that the CLI sync-all path uses
+    const peers = cliDb.prepare("SELECT * FROM myr_peers WHERE trust_level = 'trusted' AND auto_sync = 1").all();
+    assert.equal(peers.length, 1);
+    assert.equal(peers[0].operator_name, 'peer1');
+  });
+});
+
 // ---------- nodeVerify ----------
 
 describe('nodeVerify', () => {

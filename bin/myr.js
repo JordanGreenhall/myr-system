@@ -20,7 +20,7 @@ const fs = require('fs');
 const os = require('os');
 const nodeCrypto = require('crypto');
 const { sign, fingerprint: computeFingerprint } = require('../lib/crypto');
-const { syncPeer: syncPeerCore, makeSignedHeaders, httpFetch } = require('../lib/sync');
+const { syncPeer: syncPeerCore, makeSignedHeaders, httpFetch, cleanupNonces } = require('../lib/sync');
 const { verifyNode } = require('../lib/liveness');
 
 // --- Key loading helpers ---
@@ -492,7 +492,7 @@ if (require.main === module) {
           const result = await syncPeer({ db, peerName: opts.peer, keys });
           console.log(result.message);
         } else {
-          const peers = db.prepare("SELECT * FROM myr_peers WHERE trust_level = 'trusted'").all();
+          const peers = db.prepare("SELECT * FROM myr_peers WHERE trust_level = 'trusted' AND auto_sync = 1").all();
           if (peers.length === 0) {
             console.log('No trusted peers to sync from.');
             return;
@@ -510,6 +510,8 @@ if (require.main === module) {
           }
           console.log(`\nSync complete: ${totalImported} new report(s) imported.`);
         }
+
+        cleanupNonces(db);
       } catch (err) {
         console.error(err.message);
         process.exit(1);
