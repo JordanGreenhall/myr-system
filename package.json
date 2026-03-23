@@ -2,6 +2,9 @@
   "name": "myr-system",
   "version": "1.0.0",
   "description": "Methodological Yield Reports — a pistis-native intelligence compounding system",
+  "bin": {
+    "myr": "bin/myr-cli.js"
+  },
   "scripts": {
     "store": "node scripts/myr-store.js",
     "search": "node scripts/myr-search.js",
@@ -14,7 +17,8 @@
     "synthesize": "node scripts/myr-synthesize.js",
     "test": "node --test 'test/*.test.js'",
     "server": "node server/index.js",
-    "myr": "node bin/myr.js"
+    "myr": "node bin/myr-cli.js",
+    "myr:legacy": "node bin/myr.js"
   },
   "dependencies": {
     "@noble/ed25519": "^3.0.0",
