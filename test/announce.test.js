@@ -70,7 +70,7 @@ function createTestDb() {
       peer_url TEXT UNIQUE NOT NULL,
       operator_name TEXT NOT NULL,
       public_key TEXT UNIQUE NOT NULL,
-      trust_level TEXT CHECK(trust_level IN ('trusted', 'pending', 'rejected')) DEFAULT 'pending',
+      trust_level TEXT CHECK(trust_level IN ('trusted', 'pending', 'introduced', 'revoked', 'rejected')) DEFAULT 'pending',
       added_at TEXT NOT NULL,
       approved_at TEXT,
       last_sync_at TEXT,
@@ -131,7 +131,7 @@ describe('POST /myr/peers/announce', () => {
     db.close();
   });
 
-  it('valid announce from unknown peer succeeds with pending_approval', async () => {
+  it('announce from non-registry peer returns 403 forbidden', async () => {
     const body = makeAnnounceBody();
     const signed = signRequest({
       method: 'POST',
@@ -148,13 +148,13 @@ describe('POST /myr/peers/announce', () => {
       body,
     });
 
-    assert.equal(res.status, 200);
-    assert.equal(res.body.status, 'pending_approval');
-    assert.equal(res.body.message, 'Peer request received. Awaiting operator approval.');
-    assert.equal(res.body.approval_required, true);
+    // Since the test keypair is not in the signed node registry,
+    // the announce endpoint rejects with 403.
+    assert.equal(res.status, 403);
+    assert.equal(res.body.error.code, 'forbidden');
   });
 
-  it('response includes our_public_key', async () => {
+  it('non-registry peer not stored in database', async () => {
     const peerKeys2 = generateKeypair();
     const body = makeAnnounceBody({
       public_key: peerKeys2.publicKey,
@@ -169,18 +169,19 @@ describe('POST /myr/peers/announce', () => {
       publicKey: peerKeys2.publicKey,
     });
 
-    const res = await request(port, {
+    await request(port, {
       method: 'POST',
       path: '/myr/peers/announce',
       headers: signed.headers,
       body,
     });
 
-    assert.equal(res.status, 200);
-    assert.equal(res.body.our_public_key, OUR_PUBLIC_KEY_HEX);
+    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?')
+      .get(peerKeys2.publicKey);
+    assert.equal(row, undefined, 'non-registry peer should not be stored');
   });
 
-  it('peer stored in database with trust_level=pending', async () => {
+  it('non-registry peer gets no public key in response', async () => {
     const peerKeys3 = generateKeypair();
     const body = makeAnnounceBody({
       public_key: peerKeys3.publicKey,
@@ -202,15 +203,9 @@ describe('POST /myr/peers/announce', () => {
       body,
     });
 
-    assert.equal(res.status, 200);
-
-    const row = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?')
-      .get(peerKeys3.publicKey);
-    assert.ok(row, 'peer should be stored in database');
-    assert.equal(row.trust_level, 'pending');
-    assert.equal(row.operator_name, 'peer3');
-    assert.equal(row.peer_url, 'https://peer3.myr.network');
-    assert.ok(row.added_at, 'added_at should be set');
+    assert.equal(res.status, 403);
+    // Should not leak our public key on rejection
+    assert.ok(!res.body.our_public_key, 'should not expose our_public_key on 403');
   });
 
   it('400 key_mismatch when body and header keys differ', async () => {
@@ -272,7 +267,7 @@ describe('POST /myr/peers/announce', () => {
     }
   });
 
-  it('409 conflict when pending peer re-announces', async () => {
+  it('non-registry peer re-announce still gets 403', async () => {
     const body = makeAnnounceBody();
     const signed = signRequest({
       method: 'POST',
@@ -289,15 +284,14 @@ describe('POST /myr/peers/announce', () => {
       body,
     });
 
-    assert.equal(res.status, 409);
-    assert.equal(res.body.error.code, 'peer_exists');
+    // Still 403 — registry check happens before duplicate check
+    assert.equal(res.status, 403);
   });
 
-  it('trusted peer re-announcing is auto-approved with updated URL', async () => {
+  it('DB-seeded trusted peer re-announce still requires registry', async () => {
     const trustedKeys = generateKeypair();
-    const newUrl = 'https://trusted-peer-new-ip.myr.network';
 
-    // Seed a trusted peer into the DB directly
+    // Seed a trusted peer into the DB directly (simulating prior approval)
     db.prepare(
       `INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, approved_at)
        VALUES (?, ?, ?, 'trusted', ?, ?)`
@@ -307,7 +301,7 @@ describe('POST /myr/peers/announce', () => {
     const body = makeAnnounceBody({
       public_key: trustedKeys.publicKey,
       operator_name: 'trustedpeer',
-      peer_url: newUrl,
+      peer_url: 'https://trusted-peer-new-ip.myr.network',
     });
     const signed = signRequest({
       method: 'POST',
@@ -324,16 +318,8 @@ describe('POST /myr/peers/announce', () => {
       body,
     });
 
-    assert.equal(res.status, 200);
-    assert.equal(res.body.status, 'connected');
-    assert.equal(res.body.approval_required, false);
-    assert.ok(res.body.our_public_key, 'response should include our public key');
-
-    // URL should be updated in DB
-    const row = db.prepare('SELECT peer_url, trust_level FROM myr_peers WHERE public_key = ?')
-      .get(trustedKeys.publicKey);
-    assert.equal(row.peer_url, newUrl);
-    assert.equal(row.trust_level, 'trusted');
+    // Even trusted peers must be in the registry for announce to work
+    assert.equal(res.status, 403);
   });
 
   it('401 without auth headers', async () => {

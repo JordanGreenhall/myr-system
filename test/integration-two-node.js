@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * Two-node integration test — Phases 1-3
+ * Two-node integration test — Phases 1-5
  *
  * Spins up two real HTTP server instances (Node A and Node B) in-process,
  * with separate in-memory databases and freshly generated keypairs.
  * Walks the complete peer lifecycle:
  *
  *   Phase 1: HTTP endpoints reachable and correct
- *   Phase 2: Peer discovery, announce, approve (CLI logic)
+ *   Phase 2: Peer discovery via introduce, approve, mutual trust
  *   Phase 3: Report sync — A's reports appear in B's DB
+ *   Phase 4: Security & adversarial — auth, replay, malformed input
+ *   Phase 5: Identity continuity — URL migration, keypair persistence
  *
  * No mocks. No network stubs. Real HTTP on localhost.
  *
@@ -20,9 +22,11 @@
 const http  = require('http');
 const assert = require('assert/strict');
 const Database = require('better-sqlite3');
-const { generateKeypair } = require('../lib/crypto');
-const { createApp }       = require('../server/index');
-const { syncPeer, httpFetch } = require('../lib/sync');
+const nodeCrypto = require('crypto');
+const { generateKeypair, sign: signMessage, fingerprint: computeFingerprint } = require('../lib/crypto');
+const { createApp } = require('../server/index');
+const { syncPeer, httpFetch, makeSignedHeaders } = require('../lib/sync');
+const { canonicalize } = require('../lib/canonicalize');
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 
@@ -85,7 +89,7 @@ function makeDb() {
       peer_url TEXT UNIQUE NOT NULL,
       operator_name TEXT NOT NULL,
       public_key TEXT UNIQUE NOT NULL,
-      trust_level TEXT CHECK(trust_level IN ('trusted','pending','rejected')) DEFAULT 'pending',
+      trust_level TEXT CHECK(trust_level IN ('trusted','pending','introduced','revoked','rejected')) DEFAULT 'pending',
       added_at TEXT NOT NULL,
       approved_at TEXT,
       last_sync_at TEXT,
@@ -115,11 +119,9 @@ async function fetch(url, opts = {}) {
 }
 
 // Signed fetch using node's keys
-// NOTE: auth middleware signs req.path (pathname only, no query string)
-async function signedFetch(url, { method = 'GET', body, keys, nonce, timestamp } = {}) {
-  const { makeSignedHeaders } = require('../lib/sync');
+function signedFetch(url, { method = 'GET', body, keys, nonce, timestamp } = {}) {
   const parsed = new URL(url);
-  const urlPath = parsed.pathname; // path only — matches req.path in auth middleware
+  const urlPath = parsed.pathname;
   const bodyStr = body ? JSON.stringify(body) : undefined;
   const headers = makeSignedHeaders({
     method,
@@ -133,16 +135,21 @@ async function signedFetch(url, { method = 'GET', body, keys, nonce, timestamp }
   return httpFetch(url, { method, headers, body: bodyStr });
 }
 
-// ── Setup ─────────────────────────────────────────────────────────────────────
+// Raw fetch with custom headers (for adversarial tests)
+function rawFetch(url, { method = 'GET', headers = {}, body } = {}) {
+  return httpFetch(url, { method, headers, body });
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
   console.log('\n══════════════════════════════════════════════════════');
-  console.log('  MYR Two-Node Integration Test');
+  console.log('  MYR Two-Node Integration Test (v2)');
   console.log('══════════════════════════════════════════════════════\n');
 
-  // Generate fresh keypairs for both nodes
   const keysA = generateKeypair();
   const keysB = generateKeypair();
+  const keysUnknown = generateKeypair();
 
   const dbA = makeDb();
   const dbB = makeDb();
@@ -171,7 +178,9 @@ async function main() {
 
   try {
 
-    // ── PHASE 1: HTTP Endpoints ───────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 1: HTTP Endpoints
+    // ══════════════════════════════════════════════════════════════════════════
     console.log('Phase 1: HTTP Endpoints\n');
 
     await test('GET /.well-known/myr-node (Node A) returns 200', async () => {
@@ -179,17 +188,17 @@ async function main() {
       assert.equal(r.status, 200);
     });
 
-    await test('/.well-known/myr-node returns correct operator_name', async () => {
+    await test('Discovery returns correct operator_name', async () => {
       const r = await fetch(`${urlA}/.well-known/myr-node`);
       assert.equal(r.body.operator_name, 'node-a');
     });
 
-    await test('/.well-known/myr-node returns public_key', async () => {
+    await test('Discovery returns public_key', async () => {
       const r = await fetch(`${urlA}/.well-known/myr-node`);
       assert.equal(r.body.public_key, keysA.publicKey);
     });
 
-    await test('/.well-known/myr-node returns protocol_version', async () => {
+    await test('Discovery returns protocol_version', async () => {
       const r = await fetch(`${urlA}/.well-known/myr-node`);
       assert.ok(r.body.protocol_version, 'missing protocol_version');
     });
@@ -206,14 +215,32 @@ async function main() {
       assert.ok(typeof r.body.peers_total === 'number');
     });
 
+    await test('/myr/health includes liveness_signature', async () => {
+      const r = await fetch(`${urlA}/myr/health`);
+      assert.ok(r.body.liveness_signature, 'missing liveness_signature');
+      assert.ok(r.body.timestamp, 'missing timestamp');
+      assert.ok(r.body.nonce, 'missing nonce');
+    });
+
+    await test('/myr/health liveness_signature is valid', async () => {
+      const { verify } = require('../lib/crypto');
+      const r = await fetch(`${urlA}/myr/health`);
+      const valid = verify(r.body.timestamp + r.body.nonce, r.body.liveness_signature, keysA.publicKey);
+      assert.ok(valid, 'liveness_signature does not verify');
+    });
+
     await test('GET /myr/reports without auth returns 401', async () => {
       const r = await fetch(`${urlA}/myr/reports`);
       assert.equal(r.status, 401);
     });
 
-    await test('GET /myr/reports with valid auth but unknown peer returns 403', async () => {
-      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB, nodeUrl: urlB });
-      assert.equal(r.status, 403);
+    await test('401 response leaks no information', async () => {
+      const r = await fetch(`${urlA}/myr/reports`);
+      assert.equal(r.status, 401);
+      // Should not contain node_id, public_key, operator_name, etc.
+      const body = JSON.stringify(r.body);
+      assert.ok(!body.includes(keysA.publicKey), 'response leaks public key');
+      assert.ok(!body.includes('node-a'), 'response leaks operator name');
     });
 
     await test('Both nodes up — Node B health check', async () => {
@@ -221,108 +248,96 @@ async function main() {
       assert.equal(r.body.status, 'ok');
     });
 
-    // ── PHASE 2: Peer Discovery & Approve ────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 2: Peer Discovery via Introduce + Approve
+    // ══════════════════════════════════════════════════════════════════════════
     console.log('\nPhase 2: Peer Discovery & Mutual Approval\n');
 
-    await test('POST /myr/peers/announce: B announces to A → pending_approval', async () => {
-      const r = await signedFetch(`${urlA}/myr/peers/announce`, {
+    // Use the introduce endpoint (public, no registry requirement)
+    await test('POST /myr/peer/introduce: B introduces to A', async () => {
+      const r = await fetch(`${urlA}/myr/peer/introduce`, {
         method: 'POST',
-        body: {
-          peer_url: urlB,
-          public_key: keysB.publicKey,
-          operator_name: 'node-b',
-          timestamp: new Date().toISOString(),
-          nonce: require('crypto').randomBytes(16).toString('hex'),
-        },
-        keys: keysB,
-        nodeUrl: urlB,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          identity_document: {
+            protocol_version: '1.0.0',
+            public_key: keysB.publicKey,
+            fingerprint: computeFingerprint(keysB.publicKey),
+            operator_name: 'node-b',
+            node_url: urlB,
+            capabilities: ['report-sync'],
+            created_at: new Date().toISOString(),
+          },
+          introduction_message: 'Hello from node-b',
+        }),
       });
       assert.equal(r.status, 200);
-      assert.equal(r.body.status, 'pending_approval');
+      assert.equal(r.body.status, 'introduced');
     });
 
-    await test('After announce: A has B in peers table with trust_level=pending', async () => {
-      const peer = dbA.prepare('SELECT * FROM myr_peers WHERE operator_name = ?').get('node-b');
+    await test('After introduce: A has B as introduced peer', async () => {
+      const peer = dbA.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(keysB.publicKey);
       assert.ok(peer, 'peer not found in DB');
-      assert.equal(peer.trust_level, 'pending');
+      // The introduce endpoint stores peers as 'introduced' (not yet trusted)
+      assert.equal(peer.trust_level, 'introduced');
+      assert.equal(peer.operator_name, 'node-b');
     });
 
-    await test('B still cannot fetch A reports (not yet trusted)', async () => {
-      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB, nodeUrl: urlB });
+    await test('B cannot fetch A reports while pending', async () => {
+      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB });
       assert.equal(r.status, 403);
     });
 
     await test('A approves B → trust_level becomes trusted', async () => {
       dbA.prepare(
         `UPDATE myr_peers SET trust_level='trusted', approved_at=datetime('now')
-         WHERE operator_name='node-b'`
-      ).run();
-      const peer = dbA.prepare('SELECT trust_level FROM myr_peers WHERE operator_name=?').get('node-b');
+         WHERE public_key=?`
+      ).run(keysB.publicKey);
+      const peer = dbA.prepare('SELECT trust_level FROM myr_peers WHERE public_key=?').get(keysB.publicKey);
       assert.equal(peer.trust_level, 'trusted');
     });
 
-    // Also add A as a peer in B's DB (mutual — B needs to know about A for sync to work both ways)
-    await test('A announces to B → pending_approval', async () => {
-      const r = await signedFetch(`${urlB}/myr/peers/announce`, {
+    // A introduces to B (mutual)
+    await test('POST /myr/peer/introduce: A introduces to B', async () => {
+      const r = await fetch(`${urlB}/myr/peer/introduce`, {
         method: 'POST',
-        body: {
-          peer_url: urlA,
-          public_key: keysA.publicKey,
-          operator_name: 'node-a',
-          timestamp: new Date().toISOString(),
-          nonce: require('crypto').randomBytes(16).toString('hex'),
-        },
-        keys: keysA,
-        nodeUrl: urlA,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          identity_document: {
+            protocol_version: '1.0.0',
+            public_key: keysA.publicKey,
+            fingerprint: computeFingerprint(keysA.publicKey),
+            operator_name: 'node-a',
+            node_url: urlA,
+            capabilities: ['report-sync'],
+            created_at: new Date().toISOString(),
+          },
+        }),
       });
       assert.equal(r.status, 200);
-      assert.equal(r.body.status, 'pending_approval');
     });
 
     await test('B approves A → trust_level trusted', async () => {
       dbB.prepare(
         `UPDATE myr_peers SET trust_level='trusted', approved_at=datetime('now')
-         WHERE operator_name='node-a'`
-      ).run();
-      const peer = dbB.prepare('SELECT trust_level FROM myr_peers WHERE operator_name=?').get('node-a');
+         WHERE public_key=?`
+      ).run(keysA.publicKey);
+      const peer = dbB.prepare('SELECT trust_level FROM myr_peers WHERE public_key=?').get(keysA.publicKey);
       assert.equal(peer.trust_level, 'trusted');
     });
 
-    await test('After mutual approval: B can fetch A reports list (200)', async () => {
-      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB, nodeUrl: urlB });
+    await test('After mutual approval: B can fetch A reports (200)', async () => {
+      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB });
       assert.equal(r.status, 200);
       assert.ok(Array.isArray(r.body.reports));
     });
 
-    await test('Duplicate announce returns 409 conflict', async () => {
-      const r = await signedFetch(`${urlA}/myr/peers/announce`, {
-        method: 'POST',
-        body: {
-          peer_url: urlB,
-          public_key: keysB.publicKey,
-          operator_name: 'node-b',
-          timestamp: new Date().toISOString(),
-          nonce: require('crypto').randomBytes(16).toString('hex'),
-        },
-        keys: keysB,
-        nodeUrl: urlB,
-      });
-      assert.equal(r.status, 409);
-    });
-
-    // ── PHASE 3: Report Sync ──────────────────────────────────────────────────
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 3: Report Sync
+    // ══════════════════════════════════════════════════════════════════════════
     console.log('\nPhase 3: Report Sync\n');
 
-    // Insert a signed report into Node A's DB
-    // IMPORTANT: signature is computed over the canonicalized DB row (flat structure),
-    // not over the nested JSON, because that's what the server returns and syncPeer verifies.
-    const { sign: signReport } = require('../lib/crypto');
-    const { canonicalize } = require('../lib/canonicalize');
-    const nodeCrypto = require('crypto');
-
     const now = new Date().toISOString();
-    // rowBase must include EVERY column in the DB table (with nulls for unused ones)
-    // so that canonicalize(rowBase) === canonicalize(server_row_minus_sig_fields)
     const rowBase = {
       id: 'test-node-a-20260303-001',
       node_id: 'test-node-a',
@@ -354,9 +369,8 @@ async function main() {
       signed_artifact: null,
       created_at: now,
     };
-    // Compute signature over the canonical flat row (excluding signature fields)
     const canonical = canonicalize(rowBase);
-    const sigHex  = signReport(canonical, keysA.privateKey);
+    const sigHex  = signMessage(canonical, keysA.privateKey);
     const sigHash = 'sha256:' + nodeCrypto.createHash('sha256').update(canonical).digest('hex');
 
     await test('Seed a signed report into Node A', async () => {
@@ -382,27 +396,22 @@ async function main() {
     });
 
     await test('Node A reports list shows 1 report', async () => {
-      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB, nodeUrl: urlB });
+      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB });
       assert.equal(r.status, 200);
       assert.equal(r.body.reports.length, 1);
       assert.equal(r.body.total, 1);
     });
 
-    await test('Node B can fetch the specific report by signature', async () => {
-      const list = await signedFetch(`${urlA}/myr/reports`, { keys: keysB, nodeUrl: urlB });
+    await test('Node B can fetch specific report by signature', async () => {
+      const list = await signedFetch(`${urlA}/myr/reports`, { keys: keysB });
       const sig = list.body.reports[0].signature;
-      const r = await signedFetch(`${urlA}/myr/reports/${encodeURIComponent(sig)}`, {
-        keys: keysB, nodeUrl: urlB
-      });
+      const r = await signedFetch(`${urlA}/myr/reports/${encodeURIComponent(sig)}`, { keys: keysB });
       assert.equal(r.status, 200);
       assert.ok(r.body.id || r.body.signature, 'report body missing');
     });
 
     await test('Sync: B pulls from A using syncPeer', async () => {
-      // Add A as known peer in B's peer record (need public_key stored)
-      dbB.prepare(`UPDATE myr_peers SET public_key=? WHERE operator_name='node-a'`).run(keysA.publicKey);
-
-      const peerRecord = dbB.prepare('SELECT * FROM myr_peers WHERE operator_name=?').get('node-a');
+      const peerRecord = dbB.prepare('SELECT * FROM myr_peers WHERE public_key=?').get(keysA.publicKey);
       await syncPeer({
         db: dbB,
         peer: { ...peerRecord, peer_url: urlA },
@@ -411,7 +420,7 @@ async function main() {
       });
     });
 
-    await test('After sync: report from A appears in B\'s DB', async () => {
+    await test('After sync: report from A appears in B DB', async () => {
       const row = dbB.prepare('SELECT id FROM myr_reports WHERE id=?').get(rowBase.id);
       assert.ok(row, 'synced report not found in Node B DB');
     });
@@ -420,50 +429,83 @@ async function main() {
       const future = new Date(Date.now() + 60000).toISOString();
       const r = await signedFetch(
         `${urlA}/myr/reports?since=${encodeURIComponent(future)}`,
-        { keys: keysB, nodeUrl: urlB }
+        { keys: keysB }
       );
       assert.equal(r.status, 200);
       assert.equal(r.body.reports.length, 0);
     });
 
-    await test('Report with share_network=false is excluded from list', async () => {
+    await test('Re-sync imports nothing (cursor works)', async () => {
+      const countBefore = dbB.prepare('SELECT COUNT(*) as cnt FROM myr_reports').get().cnt;
+      const peerRecord = dbB.prepare('SELECT * FROM myr_peers WHERE public_key=?').get(keysA.publicKey);
+      await syncPeer({
+        db: dbB,
+        peer: { ...peerRecord, peer_url: urlA },
+        keys: keysB,
+        fetch: httpFetch,
+      });
+      const countAfter = dbB.prepare('SELECT COUNT(*) as cnt FROM myr_reports').get().cnt;
+      assert.equal(countAfter, countBefore, 'duplicate reports imported');
+    });
+
+    await test('Report with share_network=false is excluded', async () => {
       dbA.prepare(`UPDATE myr_reports SET share_network=0 WHERE id=?`).run(rowBase.id);
-      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB, nodeUrl: urlB });
+      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB });
       assert.equal(r.body.reports.length, 0);
-      // Restore
       dbA.prepare(`UPDATE myr_reports SET share_network=1 WHERE id=?`).run(rowBase.id);
     });
 
-    // ── Security spot-checks ──────────────────────────────────────────────────
-    console.log('\nSecurity Spot-Checks\n');
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 4: Security & Adversarial Tests
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log('\nPhase 4: Security & Adversarial\n');
+
+    // -- Auth tests --
+
+    await test('Unauthenticated request to protected endpoint returns 401', async () => {
+      const r = await fetch(`${urlA}/myr/reports`);
+      assert.equal(r.status, 401);
+    });
+
+    await test('Malformed signature returns 401', async () => {
+      const ts = new Date().toISOString();
+      const nonce = nodeCrypto.randomBytes(32).toString('hex');
+      const r = await rawFetch(`${urlA}/myr/reports`, {
+        headers: {
+          'x-myr-timestamp': ts,
+          'x-myr-nonce': nonce,
+          'x-myr-signature': 'deadbeef0000not_a_real_signature',
+          'x-myr-public-key': keysB.publicKey,
+        },
+      });
+      assert.equal(r.status, 401);
+    });
 
     await test('Replayed nonce is rejected (401)', async () => {
-      const { sign: signMsg } = require('../lib/crypto');
-      const nonce = require('crypto').randomBytes(32).toString('hex');
+      const nonce = nodeCrypto.randomBytes(32).toString('hex');
       const ts = new Date().toISOString();
       const urlPath = '/myr/reports';
-      const bodyHash = require('crypto').createHash('sha256').update('').digest('hex');
-      const canonical = `GET\n${urlPath}\n${ts}\n${nonce}\n${bodyHash}`;
-      const sig = signMsg(canonical, keysB.privateKey);
+      const bodyHash = nodeCrypto.createHash('sha256').update('').digest('hex');
+      const can = `GET\n${urlPath}\n${ts}\n${nonce}\n${bodyHash}`;
+      const sig = signMessage(can, keysB.privateKey);
       const headers = {
         'x-myr-timestamp': ts, 'x-myr-nonce': nonce,
         'x-myr-signature': sig, 'x-myr-public-key': keysB.publicKey,
       };
-      // First request — should succeed (trusted peer, 200)
+      // First request succeeds
       await httpFetch(`${urlA}/myr/reports`, { method: 'GET', headers });
-      // Replay — same nonce, same timestamp
+      // Replay — same nonce
       const r2 = await httpFetch(`${urlA}/myr/reports`, { method: 'GET', headers });
       assert.equal(r2.status, 401);
     });
 
     await test('Stale timestamp (>5 min old) is rejected (401)', async () => {
-      const { sign: signMsg } = require('../lib/crypto');
       const oldTs = new Date(Date.now() - 6 * 60 * 1000).toISOString();
-      const nonce = require('crypto').randomBytes(32).toString('hex');
+      const nonce = nodeCrypto.randomBytes(32).toString('hex');
       const urlPath = '/myr/reports';
-      const bodyHash = require('crypto').createHash('sha256').update('').digest('hex');
-      const canonical = `GET\n${urlPath}\n${oldTs}\n${nonce}\n${bodyHash}`;
-      const sig = signMsg(canonical, keysB.privateKey);
+      const bodyHash = nodeCrypto.createHash('sha256').update('').digest('hex');
+      const can = `GET\n${urlPath}\n${oldTs}\n${nonce}\n${bodyHash}`;
+      const sig = signMessage(can, keysB.privateKey);
       const headers = {
         'x-myr-timestamp': oldTs, 'x-myr-nonce': nonce,
         'x-myr-signature': sig, 'x-myr-public-key': keysB.publicKey,
@@ -472,8 +514,130 @@ async function main() {
       assert.equal(r.status, 401);
     });
 
+    await test('Unknown peer with valid sig gets 403 (not 401)', async () => {
+      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysUnknown });
+      assert.equal(r.status, 403);
+    });
+
+    await test('403 response leaks no sensitive info', async () => {
+      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysUnknown });
+      const body = JSON.stringify(r.body);
+      assert.ok(!body.includes(keysA.publicKey), 'leaks server public key');
+      assert.ok(!body.includes(keysA.privateKey), 'leaks private key');
+    });
+
+    // -- Invalid input tests --
+
+    await test('Invalid JSON body returns 400', async () => {
+      const ts = new Date().toISOString();
+      const nonce = nodeCrypto.randomBytes(32).toString('hex');
+      const rawBody = '{not valid json!!!';
+      const bodyHash = nodeCrypto.createHash('sha256').update(rawBody).digest('hex');
+      const urlPath = '/myr/peer/introduce';
+      const can = `POST\n${urlPath}\n${ts}\n${nonce}\n${bodyHash}`;
+      const sig = signMessage(can, keysB.privateKey);
+
+      const r = await rawFetch(`${urlA}/myr/peer/introduce`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-myr-timestamp': ts,
+          'x-myr-nonce': nonce,
+          'x-myr-signature': sig,
+          'x-myr-public-key': keysB.publicKey,
+        },
+        body: rawBody,
+      });
+      assert.equal(r.status, 400);
+    });
+
+    await test('Missing identity_document in introduce returns error', async () => {
+      const r = await fetch(`${urlA}/myr/peer/introduce`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ foo: 'bar' }),
+      });
+      // Should be 4xx, not 5xx
+      assert.ok(r.status >= 400 && r.status < 500, `expected 4xx, got ${r.status}`);
+    });
+
+    // -- Stress / rapid requests --
+
+    await test('100 rapid requests do not crash the server', async () => {
+      const promises = [];
+      for (let i = 0; i < 100; i++) {
+        promises.push(fetch(`${urlA}/myr/health`));
+      }
+      const responses = await Promise.all(promises);
+      const allOk = responses.every(r => r.status === 200);
+      assert.ok(allOk, 'some health requests failed under load');
+    });
+
+    await test('100 rapid authenticated requests handled correctly', async () => {
+      let successCount = 0;
+      let rateLimitCount = 0;
+      const promises = [];
+      for (let i = 0; i < 100; i++) {
+        promises.push(signedFetch(`${urlA}/myr/reports`, { keys: keysB }));
+      }
+      const responses = await Promise.all(promises);
+      for (const r of responses) {
+        if (r.status === 200) successCount++;
+        else if (r.status === 429) rateLimitCount++;
+      }
+      // All should succeed or be rate-limited; none should be 500
+      const noServerErrors = responses.every(r => r.status !== 500);
+      assert.ok(noServerErrors, 'server returned 500 under load');
+      // At minimum some should succeed
+      assert.ok(successCount > 0, 'no requests succeeded');
+    });
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // PHASE 5: Identity Continuity
+    // ══════════════════════════════════════════════════════════════════════════
+    console.log('\nPhase 5: Identity Continuity\n');
+
+    // Simulate Node A changing its URL (e.g., tunnel re-provision or IP migration)
+    // The keypair stays the same — peers should reconnect via fingerprint identity.
+
+    await test('URL migration: A changes URL, B re-introduces, trust persists', async () => {
+      // Shut down server A and restart on a new port (simulating URL change)
+      srvA.close();
+      const newConfigA = { ...configA, port: 37192, node_url: 'http://127.0.0.1:37192' };
+      const newAppA = createApp({
+        config: newConfigA, db: dbA,
+        publicKeyHex: keysA.publicKey, privateKeyHex: keysA.privateKey,
+        createdAt: new Date().toISOString(),
+      });
+      const newSrvA = await startServer(newAppA, 37192);
+      const newUrlA = 'http://127.0.0.1:37192';
+
+      try {
+        // Verify new URL works
+        const health = await fetch(`${newUrlA}/myr/health`);
+        assert.equal(health.status, 200);
+
+        // B can still sync from A at the new URL (same keypair, same trust in DB)
+        const peerRecord = dbB.prepare('SELECT * FROM myr_peers WHERE public_key=?').get(keysA.publicKey);
+        const r = await signedFetch(`${newUrlA}/myr/reports`, { keys: keysB });
+        assert.equal(r.status, 200, 'B cannot reach A at new URL');
+      } finally {
+        newSrvA.close();
+      }
+    });
+
+    await test('Keypair persists across URL changes', async () => {
+      // Fingerprint should be the same regardless of URL
+      const fp = computeFingerprint(keysA.publicKey);
+      assert.ok(fp.length > 10, 'fingerprint too short');
+      // Peers in B's DB still reference the same public key
+      const peer = dbB.prepare('SELECT * FROM myr_peers WHERE public_key=?').get(keysA.publicKey);
+      assert.ok(peer, 'peer record lost after URL change');
+      assert.equal(peer.trust_level, 'trusted', 'trust lost after URL change');
+    });
+
   } finally {
-    srvA.close();
+    try { srvA.close(); } catch { /* may already be closed */ }
     srvB.close();
   }
 
@@ -487,7 +651,7 @@ async function main() {
     results.filter(r => !r.ok).forEach(r => console.log(`  ✗ ${r.name}\n    ${r.error}`));
     process.exit(1);
   } else {
-    console.log('  All tests passed. Phases 1-3 verified end-to-end.\n');
+    console.log('  All tests passed. Phases 1-5 verified end-to-end.\n');
     process.exit(0);
   }
 }

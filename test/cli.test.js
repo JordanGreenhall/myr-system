@@ -48,7 +48,7 @@ function createTestDb() {
       peer_url TEXT UNIQUE NOT NULL,
       operator_name TEXT NOT NULL,
       public_key TEXT UNIQUE NOT NULL,
-      trust_level TEXT CHECK(trust_level IN ('trusted', 'pending', 'rejected')) DEFAULT 'pending',
+      trust_level TEXT CHECK(trust_level IN ('trusted', 'pending', 'introduced', 'revoked', 'rejected')) DEFAULT 'pending',
       added_at TEXT NOT NULL,
       approved_at TEXT,
       last_sync_at TEXT,
@@ -292,7 +292,8 @@ describe('addPeer', () => {
   it('announces us to the remote peer', () => {
     const remotePeer = peerDb.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(ourKeys.publicKey);
     assert.ok(remotePeer, 'remote should have stored our peer record');
-    assert.equal(remotePeer.trust_level, 'pending');
+    // The introduce endpoint stores peers with trust_level 'introduced' (not 'pending')
+    assert.equal(remotePeer.trust_level, 'introduced');
     assert.equal(remotePeer.operator_name, 'testlocal');
   });
 
