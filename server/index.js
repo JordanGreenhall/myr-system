@@ -363,15 +363,21 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         'Invalid since parameter: must be ISO8601 timestamp');
     }
 
-    let rows;
+    let rows, total;
     if (since) {
       rows = db.prepare(
         'SELECT * FROM myr_reports WHERE share_network = 1 AND created_at > ? ORDER BY created_at ASC LIMIT ?'
       ).all(since, limit);
+      total = db.prepare(
+        'SELECT COUNT(*) as cnt FROM myr_reports WHERE share_network = 1 AND created_at > ?'
+      ).get(since).cnt;
     } else {
       rows = db.prepare(
         'SELECT * FROM myr_reports WHERE share_network = 1 ORDER BY created_at ASC LIMIT ?'
       ).all(limit);
+      total = db.prepare(
+        'SELECT COUNT(*) as cnt FROM myr_reports WHERE share_network = 1'
+      ).get().cnt;
     }
 
     const reports = rows.map((row) => {
@@ -386,18 +392,21 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         signature: sig,
         operator_name: operatorName,
         created_at: row.created_at,
-        updated_at: row.updated_at,
-        week_label: row.week_label || null,
+        method_name: row.cycle_intent || null,
+        operator_rating: row.operator_rating ?? null,
         size_bytes: Buffer.byteLength(canonical, 'utf8'),
+        url: '/myr/reports/' + sig,
       };
     });
 
-    // Sync cursor: created_at of last report, or the since value
-    const syncCursor = rows.length > 0 ? rows[rows.length - 1].created_at : (since || null);
+    // sync_cursor: use as 'since' in next incremental sync call
+    const sync_cursor = rows.length > 0 ? rows[rows.length - 1].created_at : (since || null);
 
     res.json({
       reports,
-      sync_cursor: syncCursor,
+      total,
+      since,
+      sync_cursor,
     });
   });
 
@@ -418,35 +427,41 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     }
 
     const peerKey = body.public_key;
-
-    const registry = loadRegistry(config);
-    const registryNode = registry.get(peerKey);
-
-    if (!registryNode) {
-      return errorResponse(res, 'forbidden',
-        'Public key not found in signed node registry. Contact the operator to be added.');
-    }
-
     const now = new Date().toISOString();
+
     const existing = db.prepare(
       'SELECT trust_level FROM myr_peers WHERE public_key = ?'
     ).get(peerKey);
 
     if (existing) {
+      if (existing.trust_level === 'pending' || existing.trust_level === 'introduced') {
+        // Re-announce from a pending peer — 409 conflict
+        return res.status(409).json({
+          error: { code: 'peer_exists', message: 'Peer request already pending approval.' },
+        });
+      }
+      // Trusted peer re-announcing: update URL, keep trust_level
       db.prepare(
-        'UPDATE myr_peers SET peer_url = ?, operator_name = ?, trust_level = ?, approved_at = ? WHERE public_key = ?'
-      ).run(body.peer_url, body.operator_name, 'trusted', now, peerKey);
-    } else {
-      db.prepare(
-        'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, approved_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(body.peer_url, body.operator_name, peerKey, 'trusted', now, now);
+        'UPDATE myr_peers SET peer_url = ?, operator_name = ? WHERE public_key = ?'
+      ).run(body.peer_url, body.operator_name, peerKey);
+      return res.json({
+        status: 'connected',
+        our_public_key: publicKeyHex,
+        message: 'Peer reconnected with updated address.',
+        approval_required: false,
+      });
     }
 
+    // New peer — store as pending
+    db.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(body.peer_url, body.operator_name, peerKey, 'pending', now);
+
     return res.json({
-      status: 'connected',
+      status: 'pending_approval',
       our_public_key: publicKeyHex,
-      message: 'Registry member recognized. Connection confirmed.',
-      approval_required: false,
+      message: 'Peer request received. Awaiting operator approval.',
+      approval_required: true,
     });
   });
 
