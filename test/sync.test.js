@@ -54,6 +54,18 @@ function createTestDb() {
       expires_at TEXT NOT NULL
     );
     CREATE INDEX idx_nonces_expires ON myr_nonces(expires_at);
+
+    CREATE TABLE myr_traces (
+      trace_id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      event_type TEXT NOT NULL CHECK(event_type IN ('introduce','approve','share','sync_pull','sync_push','verify','reject')),
+      actor_fingerprint TEXT NOT NULL,
+      target_fingerprint TEXT,
+      artifact_signature TEXT,
+      outcome TEXT NOT NULL CHECK(outcome IN ('success','failure','rejected')),
+      rejection_reason TEXT,
+      metadata TEXT DEFAULT '{}'
+    );
   `);
 
   return db;
@@ -334,6 +346,60 @@ describe('syncPeer (lib/sync)', () => {
     assert.equal(result.imported, 0);
     assert.equal(result.skipped, 0);
     assert.equal(result.failed, 0);
+
+    db.close();
+  });
+
+  it('writes sync_pull traces to myr_traces on import', async () => {
+    const db = createTestDb();
+    const r1 = createSignedReport({ id: 'r1', created_at: '2026-03-01T10:00:00Z' }, peerKeys.privateKey);
+    const r2 = createSignedReport({ id: 'r2', created_at: '2026-03-01T11:00:00Z' }, peerKeys.privateKey);
+    const mockFetch = createMockFetch([r1, r2]);
+
+    const peer = {
+      peer_url: 'http://localhost:9999',
+      operator_name: 'testpeer',
+      public_key: peerKeys.publicKey,
+      last_sync_at: null,
+    };
+    db.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(peer.peer_url, peer.operator_name, peer.public_key, 'trusted', '2026-03-01T00:00:00Z');
+
+    const result = await syncPeer({ db, peer, keys: ourKeys, fetch: mockFetch });
+    assert.equal(result.imported, 2);
+
+    const traces = db.prepare("SELECT * FROM myr_traces WHERE event_type = 'sync_pull'").all();
+    assert.equal(traces.length, 2, 'should have 2 sync_pull trace rows');
+    assert.equal(traces[0].outcome, 'success');
+    assert.ok(traces[0].actor_fingerprint, 'actor_fingerprint should be set');
+    assert.ok(traces[0].target_fingerprint, 'target_fingerprint should be set');
+
+    db.close();
+  });
+
+  it('writes reject traces for invalid operator signatures', async () => {
+    const db = createTestDb();
+    const wrongKeys = generateKeypair();
+    const badReport = createSignedReport({ id: 'bad1', created_at: '2026-03-01T10:00:00Z' }, wrongKeys.privateKey);
+    const mockFetch = createMockFetch([badReport]);
+
+    const peer = {
+      peer_url: 'http://localhost:9999',
+      operator_name: 'testpeer',
+      public_key: peerKeys.publicKey,
+      last_sync_at: null,
+    };
+    db.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(peer.peer_url, peer.operator_name, peer.public_key, 'trusted', '2026-03-01T00:00:00Z');
+
+    await syncPeer({ db, peer, keys: ourKeys, fetch: mockFetch });
+
+    const traces = db.prepare("SELECT * FROM myr_traces WHERE event_type = 'reject'").all();
+    assert.equal(traces.length, 1, 'should have 1 reject trace row');
+    assert.equal(traces[0].outcome, 'rejected');
+    assert.ok(traces[0].rejection_reason, 'rejection_reason should be set');
 
     db.close();
   });

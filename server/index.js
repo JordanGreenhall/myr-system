@@ -10,6 +10,7 @@ const { createRateLimiter } = require('./middleware/rate-limit');
 const { canonicalize } = require('../lib/canonicalize');
 const { sign: signMessage, fingerprint: computeFingerprint } = require('../lib/crypto');
 const { verifyLivenessProof, verifyNode } = require('../lib/liveness');
+const { writeTrace } = require('../lib/trace');
 
 function loadPublicKeyHex(keysPath, nodeId) {
   const publicKeyPath = path.join(keysPath, `${nodeId}.public.pem`);
@@ -251,6 +252,16 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       created_at: createdAt,
     } : null;
 
+    if (publicKeyHex) {
+      writeTrace(db, {
+        eventType: 'introduce',
+        actorFingerprint: computeFingerprint(public_key),
+        targetFingerprint: computeFingerprint(publicKeyHex),
+        outcome: 'success',
+        metadata: { operator_name, node_url: node_url || '', existing: !!existing },
+      });
+    }
+
     return res.json({
       status: 'introduced',
       our_identity: ourIdentity,
@@ -331,6 +342,13 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
           publicKeyHex,
         );
 
+        writeTrace(db, {
+          eventType: 'verify',
+          actorFingerprint: computeFingerprint(publicKeyHex),
+          outcome: result.verified ? 'success' : 'failure',
+          metadata: { self: true, reason: result.reason || null },
+        });
+
         return res.json({
           verified: result.verified,
           fingerprint: computeFingerprint(publicKeyHex),
@@ -363,6 +381,16 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       }
 
       const result = await verifyNode(targetPeer.peer_url);
+
+      if (publicKeyHex) {
+        writeTrace(db, {
+          eventType: 'verify',
+          actorFingerprint: computeFingerprint(publicKeyHex),
+          targetFingerprint: targetFingerprint,
+          outcome: result.verified ? 'success' : 'failure',
+          metadata: { operator_name: result.operator_name || targetPeer.operator_name, reason: result.reason || null },
+        });
+      }
 
       return res.json({
         verified: result.verified,
@@ -488,6 +516,16 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       db.prepare(
         'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, approved_at) VALUES (?, ?, ?, ?, ?, ?)'
       ).run(body.peer_url, body.operator_name, peerKey, 'trusted', now, now);
+    }
+
+    if (publicKeyHex) {
+      writeTrace(db, {
+        eventType: 'introduce',
+        actorFingerprint: computeFingerprint(peerKey),
+        targetFingerprint: computeFingerprint(publicKeyHex),
+        outcome: 'success',
+        metadata: { operator_name: body.operator_name, via: 'announce', existing: !!existing },
+      });
     }
 
     return res.json({

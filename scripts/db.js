@@ -19,6 +19,7 @@ function getDb() {
   migratePhase2Columns(db);
   migrateIdScheme(db);
   migrateNoncesTable(db);
+  migrateTracesTable(db);
 
   return db;
 }
@@ -189,6 +190,25 @@ function migrateNoncesTable(db) {
       expires_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_nonces_expires ON myr_nonces(expires_at);
+  `);
+}
+
+function migrateTracesTable(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS myr_traces (
+      trace_id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      event_type TEXT NOT NULL CHECK(event_type IN ('introduce','approve','share','sync_pull','sync_push','verify','reject')),
+      actor_fingerprint TEXT NOT NULL,
+      target_fingerprint TEXT,
+      artifact_signature TEXT,
+      outcome TEXT NOT NULL CHECK(outcome IN ('success','failure','rejected')),
+      rejection_reason TEXT,
+      metadata TEXT DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_traces_timestamp ON myr_traces(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_traces_event_type ON myr_traces(event_type);
+    CREATE INDEX IF NOT EXISTS idx_traces_actor ON myr_traces(actor_fingerprint);
   `);
 }
 
