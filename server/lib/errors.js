@@ -9,6 +9,8 @@ const STATUS_CODES = {
   peer_not_trusted: 403,
   invalid_request: 400,
   key_mismatch: 400,
+  invalid_signature: 400,
+  relay_error: 502,
   conflict: 409,
   peer_not_found: 404,
   peer_exists: 409,

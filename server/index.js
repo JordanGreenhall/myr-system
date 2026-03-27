@@ -8,7 +8,8 @@ const { errorResponse } = require('./lib/errors');
 const { createAuthMiddleware } = require('./middleware/auth');
 const { createRateLimiter } = require('./middleware/rate-limit');
 const { canonicalize } = require('../lib/canonicalize');
-const { sign: signMessage, fingerprint: computeFingerprint } = require('../lib/crypto');
+const { sign: signMessage, verify: verifySignature, fingerprint: computeFingerprint } = require('../lib/crypto');
+const { httpFetch } = require('../lib/sync');
 const { verifyLivenessProof, verifyNode } = require('../lib/liveness');
 const { writeTrace } = require('../lib/trace');
 
@@ -269,6 +270,124 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       message: 'Introduction received. Mutual approval required before sync is enabled.',
     });
   });
+
+  // --- Relay endpoint (public, uses body-level sig verification, rate-limited by fingerprint) ---
+  // POST /myr/relay — forwards signed MYR payloads to known peers (fire-and-proxy)
+  {
+    const relayRateCounts = new Map();
+    const relayRateCleanup = setInterval(() => {
+      const cutoff = Date.now() - 60000;
+      for (const [key, entry] of relayRateCounts) {
+        if (entry.windowStart < cutoff) relayRateCounts.delete(key);
+      }
+    }, 5 * 60 * 1000);
+    if (relayRateCleanup.unref) relayRateCleanup.unref();
+
+    function relayRateLimit(fingerprint) {
+      const now = Date.now();
+      let entry = relayRateCounts.get(fingerprint);
+      if (!entry || now - entry.windowStart > 60000) {
+        relayRateCounts.set(fingerprint, { count: 1, windowStart: now });
+        return true;
+      }
+      if (entry.count >= 60) return false;
+      entry.count++;
+      return true;
+    }
+
+    app.post('/myr/relay', async (req, res) => {
+      const { from_fingerprint, to_fingerprint, payload_b64, signature } = req.body || {};
+
+      if (!from_fingerprint || !to_fingerprint || !payload_b64 || !signature) {
+        return errorResponse(res, 'invalid_request',
+          'Missing required relay fields: from_fingerprint, to_fingerprint, payload_b64, signature');
+      }
+
+      // Rate limit by sender fingerprint
+      if (!relayRateLimit(from_fingerprint)) {
+        return res.status(429)
+          .set('Retry-After', '60')
+          .json({ error: { code: 'rate_limit_exceeded', message: 'Rate limit exceeded' } });
+      }
+
+      // Verify sender is a known peer
+      const allPeers = db.prepare('SELECT * FROM myr_peers').all();
+      const senderPeer = allPeers.find(p =>
+        computeFingerprint(p.public_key) === from_fingerprint
+      );
+
+      if (!senderPeer) {
+        return errorResponse(res, 'forbidden',
+          'Sender fingerprint not in peer list. Relay denied.');
+      }
+
+      // Verify Ed25519 signature over payload_b64 using sender's public key
+      if (!verifySignature(payload_b64, signature, senderPeer.public_key)) {
+        return errorResponse(res, 'invalid_signature',
+          'Payload signature verification failed');
+      }
+
+      // Find recipient peer by fingerprint
+      const recipientPeer = allPeers.find(p =>
+        computeFingerprint(p.public_key) === to_fingerprint
+      );
+
+      if (!recipientPeer || !recipientPeer.peer_url) {
+        return errorResponse(res, 'peer_not_found',
+          'Recipient fingerprint not found or has no URL');
+      }
+
+      // Decode the inner request payload
+      let innerRequest;
+      try {
+        innerRequest = JSON.parse(Buffer.from(payload_b64, 'base64').toString('utf8'));
+      } catch {
+        return errorResponse(res, 'invalid_request', 'Invalid payload_b64 encoding');
+      }
+
+      const { method, path: urlPath, headers: innerHeaders, body: innerBody } = innerRequest;
+      if (!method || !urlPath) {
+        return errorResponse(res, 'invalid_request', 'Relay payload missing method or path');
+      }
+
+      // Forward to recipient — proxy the inner MYR request
+      const targetUrl = recipientPeer.peer_url.replace(/\/$/, '') + urlPath;
+      const forwardOptions = { method, headers: innerHeaders || {} };
+      if (innerBody) forwardOptions.body = innerBody;
+
+      try {
+        const proxyRes = await httpFetch(targetUrl, forwardOptions);
+
+        if (publicKeyHex) {
+          writeTrace(db, {
+            eventType: 'relay_sync',
+            actorFingerprint: from_fingerprint,
+            targetFingerprint: to_fingerprint,
+            outcome: 'success',
+            metadata: { method, path: urlPath, proxy_status: proxyRes.status },
+          });
+        }
+
+        return res.json({
+          status: proxyRes.status,
+          body: proxyRes.body,
+          headers: proxyRes.headers,
+        });
+      } catch (err) {
+        if (publicKeyHex) {
+          writeTrace(db, {
+            eventType: 'relay_sync',
+            actorFingerprint: from_fingerprint,
+            targetFingerprint: to_fingerprint,
+            outcome: 'failure',
+            metadata: { method, path: urlPath, error: err.message },
+          });
+        }
+        return errorResponse(res, 'relay_error',
+          'Failed to forward request to recipient', err.message);
+      }
+    });
+  }
 
   // Auth middleware for all subsequent (protected) routes
   app.use(createAuthMiddleware(db));

@@ -21,6 +21,7 @@ const os = require('os');
 const nodeCrypto = require('crypto');
 const { sign, fingerprint: computeFingerprint } = require('../lib/crypto');
 const { syncPeer: syncPeerCore, makeSignedHeaders, httpFetch, cleanupNonces } = require('../lib/sync');
+const { TOPIC_NAME, discoverPeers, startBackgroundAnnounce } = require('../lib/dht');
 const { verifyNode } = require('../lib/liveness');
 
 // --- Key loading helpers ---
@@ -289,6 +290,18 @@ function getDbFromNodeConfig(nodeConfig) {
         expires_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_nonces_expires ON myr_nonces(expires_at);
+      CREATE TABLE IF NOT EXISTS myr_traces (
+        trace_id TEXT PRIMARY KEY,
+        timestamp TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        actor_fingerprint TEXT NOT NULL,
+        target_fingerprint TEXT,
+        artifact_signature TEXT,
+        outcome TEXT NOT NULL,
+        rejection_reason TEXT,
+        metadata TEXT DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_traces_timestamp ON myr_traces(timestamp);
     `);
     return db;
   }
@@ -471,6 +484,88 @@ if (require.main === module) {
       }
     });
 
+  // myr peer discover [--timeout <ms>] [--auto-introduce]
+  peerCmd
+    .command('discover')
+    .description('Discover peers on the DHT network (myr-network-v1)')
+    .option('--timeout <ms>', 'Discovery timeout in milliseconds (default: 30000)', parseInt)
+    .option('--auto-introduce', 'Automatically introduce to each discovered node not already a peer')
+    .action(async (opts) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error('Node not configured. Run: myr setup');
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        db = getDbFromNodeConfig(nodeConfig);
+        const keys = loadKeypair(nodeConfig);
+        const timeoutMs = opts.timeout || 30000;
+
+        console.log(`Scanning ${TOPIC_NAME} (DHT)...`);
+        const { writeTrace } = require('../lib/trace');
+
+        const discovered = await discoverPeers({ timeoutMs });
+
+        if (discovered.length === 0) {
+          console.log('No nodes discovered on ' + TOPIC_NAME + '.');
+          return;
+        }
+
+        console.log(`\nDiscovered ${discovered.length} node(s) on ${TOPIC_NAME}:`);
+
+        for (const identity of discovered) {
+          if (!identity.public_key) continue;
+          const fp = computeFingerprint(identity.public_key);
+          const fpShort = fp.slice(0, 8) + '...';
+          const existing = db.prepare(
+            'SELECT trust_level FROM myr_peers WHERE public_key = ?'
+          ).get(identity.public_key);
+
+          let status;
+          if (existing) {
+            status = '[already peer]';
+          } else if (opts.autoIntroduce && identity.node_url) {
+            try {
+              await addPeer({ db, config: nodeConfig, url: identity.node_url, keys });
+              status = '[introduced]';
+            } catch (err) {
+              status = `[introduce failed: ${err.message.slice(0, 40)}]`;
+            }
+          } else {
+            status = '[new]';
+          }
+
+          // Log discovery trace
+          writeTrace(db, {
+            eventType: 'discover',
+            actorFingerprint: computeFingerprint(keys.publicKey),
+            targetFingerprint: fp,
+            outcome: 'success',
+            metadata: {
+              operator_name: identity.operator_name || null,
+              node_url: identity.node_url || null,
+              via: 'dht',
+              already_peer: !!existing,
+            },
+          });
+
+          console.log(
+            `  ${(identity.operator_name || '?').padEnd(16)}` +
+            `  (${fpShort})` +
+            `  ${(identity.node_url || '?').padEnd(38)}` +
+            `  ${status}`
+          );
+        }
+      } catch (err) {
+        console.error(err.message);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
   // ── myr sync ────────────────────────────────────────────────────────────────
   program
     .command('sync')
@@ -584,17 +679,47 @@ if (require.main === module) {
         privateKeyHex: keys.privateKey,
       });
 
+      let dhtAnnouncer = null;
+
       const server = app.listen(port, () => {
         console.log(`MYR node server started`);
         console.log(`  Operator: ${nodeConfig.operator_name}`);
         console.log(`  URL:      ${nodeUrl}`);
         console.log(`  Port:     ${port}`);
         console.log(`  Discovery: ${nodeUrl}/.well-known/myr-node`);
+
+        // Start DHT background announce if enabled in config
+        if (nodeConfig.discovery && nodeConfig.discovery.dht_enabled) {
+          const identityDocument = {
+            protocol_version: '1.0.0',
+            node_url: nodeUrl,
+            operator_name: nodeConfig.operator_name,
+            public_key: keys.publicKey,
+            fingerprint: computeFingerprint(keys.publicKey),
+            capabilities: ['report-sync', 'peer-discovery', 'incremental-sync'],
+            created_at: new Date().toISOString(),
+          };
+          dhtAnnouncer = startBackgroundAnnounce({
+            identityDocument,
+            privateKey: keys.privateKey,
+            onError: (err) => console.error('DHT announce error:', err.message),
+          });
+          console.log(`  DHT: Announcing on ${TOPIC_NAME}`);
+        }
+
+        // Show relay status
+        const relayConfig = nodeConfig.relay;
+        if (relayConfig && relayConfig.enabled) {
+          const fallbackStr = relayConfig.fallback_only !== false ? '(fallback)' : '(always)';
+          console.log(`  Relay:     ${relayConfig.url} ${fallbackStr}`);
+        }
+
         console.log('Press Ctrl+C to stop.');
       });
 
       function shutdown(signal) {
         console.log(`\n${signal} received. Shutting down...`);
+        if (dhtAnnouncer) dhtAnnouncer.stop().catch(() => {});
         server.close(() => { db.close(); process.exit(0); });
         setTimeout(() => process.exit(1), 5000).unref();
       }
@@ -629,6 +754,12 @@ if (require.main === module) {
         console.log(`  Fingerprint: ${fp}`);
         console.log(`  URL:         ${nodeConfig.node_url || '(not set)'}`);
         console.log(`  Port:        ${nodeConfig.port || 3719}`);
+
+        const relayConfig = nodeConfig.relay;
+        if (relayConfig && relayConfig.enabled) {
+          const fallbackStr = relayConfig.fallback_only !== false ? 'fallback enabled' : 'always active';
+          console.log(`  Relay:       ${relayConfig.url} (${fallbackStr})`);
+        }
 
         console.log('\nPeers:');
         console.log(`  Trusted: ${trustedPeers.length}`);

@@ -25,6 +25,7 @@
     "better-sqlite3": "^11.8.1",
     "chalk": "^4.1.2",
     "commander": "^13.1.0",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "hyperswarm": "^4.17.0"
   }
 }

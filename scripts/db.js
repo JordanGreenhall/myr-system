@@ -20,6 +20,7 @@ function getDb() {
   migrateIdScheme(db);
   migrateNoncesTable(db);
   migrateTracesTable(db);
+  migrateTracesEventTypes(db);
 
   return db;
 }
@@ -198,7 +199,7 @@ function migrateTracesTable(db) {
     CREATE TABLE IF NOT EXISTS myr_traces (
       trace_id TEXT PRIMARY KEY,
       timestamp TEXT NOT NULL,
-      event_type TEXT NOT NULL CHECK(event_type IN ('introduce','approve','share','sync_pull','sync_push','verify','reject')),
+      event_type TEXT NOT NULL CHECK(event_type IN ('introduce','approve','share','sync_pull','sync_push','verify','reject','discover','relay_sync')),
       actor_fingerprint TEXT NOT NULL,
       target_fingerprint TEXT,
       artifact_signature TEXT,
@@ -210,6 +211,38 @@ function migrateTracesTable(db) {
     CREATE INDEX IF NOT EXISTS idx_traces_event_type ON myr_traces(event_type);
     CREATE INDEX IF NOT EXISTS idx_traces_actor ON myr_traces(actor_fingerprint);
   `);
+}
+
+/**
+ * Upgrade existing myr_traces table to support v1.1 event types (discover, relay_sync).
+ * Uses table recreation since SQLite does not support ALTER TABLE to modify CHECK constraints.
+ */
+function migrateTracesEventTypes(db) {
+  const tableInfo = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='myr_traces'"
+  ).get();
+
+  // If table doesn't exist yet (will be created by migrateTracesTable) or already upgraded
+  if (!tableInfo || (tableInfo.sql && tableInfo.sql.includes("'discover'"))) return;
+
+  // Recreate with updated constraint
+  db.exec(`CREATE TABLE myr_traces_v11 (
+    trace_id TEXT PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN ('introduce','approve','share','sync_pull','sync_push','verify','reject','discover','relay_sync')),
+    actor_fingerprint TEXT NOT NULL,
+    target_fingerprint TEXT,
+    artifact_signature TEXT,
+    outcome TEXT NOT NULL CHECK(outcome IN ('success','failure','rejected')),
+    rejection_reason TEXT,
+    metadata TEXT DEFAULT '{}'
+  )`);
+  db.exec('INSERT OR IGNORE INTO myr_traces_v11 SELECT * FROM myr_traces');
+  db.exec('DROP TABLE myr_traces');
+  db.exec('ALTER TABLE myr_traces_v11 RENAME TO myr_traces');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_traces_timestamp ON myr_traces(timestamp)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_traces_event_type ON myr_traces(event_type)');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_traces_actor ON myr_traces(actor_fingerprint)');
 }
 
 function generateId(db) {
