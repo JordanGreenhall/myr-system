@@ -21,6 +21,7 @@ function getDb() {
   migrateNoncesTable(db);
   migrateTracesTable(db);
   migrateTracesEventTypes(db);
+  migrateFingerprintVerification(db);
 
   return db;
 }
@@ -243,6 +244,20 @@ function migrateTracesEventTypes(db) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_traces_timestamp ON myr_traces(timestamp)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_traces_event_type ON myr_traces(event_type)');
   db.exec('CREATE INDEX IF NOT EXISTS idx_traces_actor ON myr_traces(actor_fingerprint)');
+}
+
+function migrateFingerprintVerification(db) {
+  const addColumn = (table, col, typedef) => {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${typedef}`);
+    } catch (_) {
+      // column already exists
+    }
+  };
+
+  addColumn('myr_peers', 'node_uuid', 'TEXT');
+  addColumn('myr_peers', 'verification_evidence', 'TEXT');
+  addColumn('myr_peers', 'auto_approved', 'INTEGER DEFAULT 0');
 }
 
 function generateId(db) {

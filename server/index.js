@@ -9,7 +9,7 @@ const { createAuthMiddleware } = require('./middleware/auth');
 const { createRateLimiter } = require('./middleware/rate-limit');
 const { canonicalize } = require('../lib/canonicalize');
 const { sign: signMessage, verify: verifySignature, fingerprint: computeFingerprint } = require('../lib/crypto');
-const { httpFetch } = require('../lib/sync');
+const { httpFetch, makeSignedHeaders } = require('../lib/sync');
 const { verifyLivenessProof, verifyNode } = require('../lib/liveness');
 const { writeTrace } = require('../lib/trace');
 
@@ -131,9 +131,10 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     }
 
     res.json({
-      protocol_version: '1.0.0',
+      protocol_version: '1.2.0',
       node_url: nodeUrl,
       operator_name: operatorName,
+      node_uuid: config.node_uuid || null,
       public_key: publicKeyHex,
       fingerprint: computeFingerprint(publicKeyHex),
       capabilities: ['report-sync', 'peer-discovery', 'incremental-sync'],
@@ -594,7 +595,7 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
   });
 
   // --- Peer announce endpoint (auth required, unknown peers allowed) ---
-  app.post('/myr/peers/announce', (req, res) => {
+  app.post('/myr/peers/announce', async (req, res) => {
     const body = req.body || {};
     const requiredFields = ['peer_url', 'public_key', 'operator_name', 'timestamp', 'nonce'];
     for (const field of requiredFields) {
@@ -610,48 +611,328 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     }
 
     const peerKey = body.public_key; // hex
+    const hasFingerprint = !!body.fingerprint;
 
-    // Check the signed registry — registry membership IS approval.
+    // Check the signed registry — registry membership IS approval (v1.1.0 path).
     const registry = loadRegistry(config);
     const registryNode = registry.get(peerKey);
 
-    if (!registryNode) {
-      return errorResponse(res, 'forbidden',
-        'Public key not found in signed node registry. Contact the operator to be added.');
+    // v1.1.0 path: no fingerprint in payload → require registry, auto-trust
+    if (!hasFingerprint) {
+      if (!registryNode) {
+        return errorResponse(res, 'forbidden',
+          'Public key not found in signed node registry. Contact the operator to be added.');
+      }
+
+      const now = new Date().toISOString();
+      const existing = db.prepare(
+        'SELECT trust_level FROM myr_peers WHERE public_key = ?'
+      ).get(peerKey);
+
+      if (existing) {
+        db.prepare(
+          'UPDATE myr_peers SET peer_url = ?, operator_name = ?, trust_level = ?, approved_at = ? WHERE public_key = ?'
+        ).run(body.peer_url, body.operator_name, 'trusted', now, peerKey);
+      } else {
+        db.prepare(
+          'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, approved_at) VALUES (?, ?, ?, ?, ?, ?)'
+        ).run(body.peer_url, body.operator_name, peerKey, 'trusted', now, now);
+      }
+
+      if (publicKeyHex) {
+        writeTrace(db, {
+          eventType: 'introduce',
+          actorFingerprint: computeFingerprint(peerKey),
+          targetFingerprint: computeFingerprint(publicKeyHex),
+          outcome: 'success',
+          metadata: { operator_name: body.operator_name, via: 'announce', existing: !!existing },
+        });
+      }
+
+      return res.json({
+        status: 'connected',
+        our_public_key: publicKeyHex,
+        message: 'Registry member recognized. Connection confirmed.',
+        approval_required: false,
+        trust_level: 'trusted',
+        verification_status: 'unverified',
+        auto_approved: false,
+      });
     }
 
+    // --- v1.2.0 path: fingerprint present → in-band verification ---
     const now = new Date().toISOString();
+    const announcedFingerprint = body.fingerprint;
+    const computedFromAnnounced = computeFingerprint(peerKey);
+
+    // Step 1: announced fingerprint must match computed from announced public key
+    if (announcedFingerprint !== computedFromAnnounced) {
+      const evidence = {
+        announced_fingerprint: announcedFingerprint,
+        computed_from_announced_key: computedFromAnnounced,
+        check_failed: 'announced_fingerprint_mismatch',
+      };
+
+      const existing = db.prepare(
+        'SELECT trust_level FROM myr_peers WHERE public_key = ?'
+      ).get(peerKey);
+
+      if (existing) {
+        db.prepare(
+          'UPDATE myr_peers SET peer_url = ?, operator_name = ?, trust_level = ?, verification_evidence = ?, node_uuid = ? WHERE public_key = ?'
+        ).run(body.peer_url, body.operator_name, 'rejected', JSON.stringify(evidence), body.node_uuid || null, peerKey);
+      } else {
+        db.prepare(
+          'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, verification_evidence, node_uuid) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).run(body.peer_url, body.operator_name, peerKey, 'rejected', now, JSON.stringify(evidence), body.node_uuid || null);
+      }
+
+      if (publicKeyHex) {
+        writeTrace(db, {
+          eventType: 'verify',
+          actorFingerprint: computedFromAnnounced,
+          targetFingerprint: computeFingerprint(publicKeyHex),
+          outcome: 'rejected',
+          rejectionReason: 'announced_fingerprint_mismatch',
+          metadata: evidence,
+        });
+      }
+
+      return res.json({
+        status: 'rejected',
+        message: 'Fingerprint verification failed: announced fingerprint does not match public key.',
+        trust_level: 'rejected',
+        verification_status: 'failed',
+        auto_approved: false,
+      });
+    }
+
+    // Step 2: Fetch discovery document from the announcing peer
+    let discoveryDoc = null;
+    let discoveryError = null;
+    try {
+      const discoveryUrl = body.peer_url.replace(/\/+$/, '') + '/.well-known/myr-node';
+      const fetchPromise = httpFetch(discoveryUrl);
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Discovery fetch timeout (5s)')), 5000)
+      );
+      const discoveryRes = await Promise.race([fetchPromise, timeoutPromise]);
+      if (discoveryRes.status === 200 && discoveryRes.body && typeof discoveryRes.body === 'object') {
+        discoveryDoc = discoveryRes.body;
+      } else {
+        discoveryError = `Discovery doc returned status ${discoveryRes.status}`;
+      }
+    } catch (err) {
+      discoveryError = err.message;
+    }
+
+    // Discovery doc fetch failed → set trust to pending (not rejected)
+    if (!discoveryDoc) {
+      const evidence = {
+        announced_fingerprint: announcedFingerprint,
+        computed_from_announced_key: computedFromAnnounced,
+        discovery_error: discoveryError,
+        check_failed: 'discovery_fetch_failed',
+      };
+
+      const existing = db.prepare(
+        'SELECT trust_level FROM myr_peers WHERE public_key = ?'
+      ).get(peerKey);
+
+      if (existing) {
+        db.prepare(
+          'UPDATE myr_peers SET peer_url = ?, operator_name = ?, trust_level = ?, verification_evidence = ?, node_uuid = ? WHERE public_key = ?'
+        ).run(body.peer_url, body.operator_name, 'pending', JSON.stringify(evidence), body.node_uuid || null, peerKey);
+      } else {
+        db.prepare(
+          'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, verification_evidence, node_uuid) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).run(body.peer_url, body.operator_name, peerKey, 'pending', now, JSON.stringify(evidence), body.node_uuid || null);
+      }
+
+      return res.json({
+        status: 'pending',
+        message: 'Discovery document could not be fetched. Peer saved as pending.',
+        trust_level: 'pending',
+        verification_status: 'unverified',
+        auto_approved: false,
+      });
+    }
+
+    // Validate discovery doc has required fields
+    if (!discoveryDoc.public_key || !discoveryDoc.fingerprint) {
+      const evidence = {
+        announced_fingerprint: announcedFingerprint,
+        computed_from_announced_key: computedFromAnnounced,
+        discovery_doc_keys: Object.keys(discoveryDoc),
+        check_failed: 'discovery_doc_malformed',
+      };
+
+      const existing = db.prepare(
+        'SELECT trust_level FROM myr_peers WHERE public_key = ?'
+      ).get(peerKey);
+
+      if (existing) {
+        db.prepare(
+          'UPDATE myr_peers SET peer_url = ?, operator_name = ?, trust_level = ?, verification_evidence = ?, node_uuid = ? WHERE public_key = ?'
+        ).run(body.peer_url, body.operator_name, 'rejected', JSON.stringify(evidence), body.node_uuid || null, peerKey);
+      } else {
+        db.prepare(
+          'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, verification_evidence, node_uuid) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).run(body.peer_url, body.operator_name, peerKey, 'rejected', now, JSON.stringify(evidence), body.node_uuid || null);
+      }
+
+      return res.json({
+        status: 'rejected',
+        message: 'Discovery document is malformed (missing public_key or fingerprint).',
+        trust_level: 'rejected',
+        verification_status: 'failed',
+        auto_approved: false,
+      });
+    }
+
+    // Step 3: 3-way verification
+    const discoveryFingerprint = discoveryDoc.fingerprint;
+    const discoveryKey = discoveryDoc.public_key;
+    const computedFromDiscovery = computeFingerprint(discoveryKey);
+
+    const checks = {
+      announced_fp_matches_key: announcedFingerprint === computedFromAnnounced,
+      discovery_fp_matches_key: discoveryFingerprint === computedFromDiscovery,
+      announced_key_matches_discovery: peerKey === discoveryKey,
+    };
+    const allPass = checks.announced_fp_matches_key && checks.discovery_fp_matches_key && checks.announced_key_matches_discovery;
+
+    const evidence = {
+      announced_fingerprint: announcedFingerprint,
+      computed_from_announced_key: computedFromAnnounced,
+      discovery_fingerprint: discoveryFingerprint,
+      computed_from_discovery_key: computedFromDiscovery,
+      announced_public_key: peerKey,
+      discovery_public_key: discoveryKey,
+      checks,
+      all_passed: allPass,
+    };
+
+    if (!allPass) {
+      // Determine which check failed for logging
+      let failReason = 'unknown';
+      if (!checks.discovery_fp_matches_key) failReason = 'discovery_fingerprint_mismatch';
+      else if (!checks.announced_key_matches_discovery) failReason = 'public_key_mismatch';
+
+      const existing = db.prepare(
+        'SELECT trust_level FROM myr_peers WHERE public_key = ?'
+      ).get(peerKey);
+
+      if (existing) {
+        db.prepare(
+          'UPDATE myr_peers SET peer_url = ?, operator_name = ?, trust_level = ?, verification_evidence = ?, node_uuid = ? WHERE public_key = ?'
+        ).run(body.peer_url, body.operator_name, 'rejected', JSON.stringify(evidence), body.node_uuid || null, peerKey);
+      } else {
+        db.prepare(
+          'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, verification_evidence, node_uuid) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).run(body.peer_url, body.operator_name, peerKey, 'rejected', now, JSON.stringify(evidence), body.node_uuid || null);
+      }
+
+      if (publicKeyHex) {
+        writeTrace(db, {
+          eventType: 'verify',
+          actorFingerprint: computedFromAnnounced,
+          targetFingerprint: computeFingerprint(publicKeyHex),
+          outcome: 'rejected',
+          rejectionReason: failReason,
+          metadata: evidence,
+        });
+      }
+
+      return res.json({
+        status: 'rejected',
+        message: `Fingerprint verification failed: ${failReason}.`,
+        trust_level: 'rejected',
+        verification_status: 'failed',
+        auto_approved: false,
+      });
+    }
+
+    // All 3 checks pass — determine trust level
+    let trustLevel = 'verified-pending-approval';
+    let autoApproved = false;
+    const autoApproveEnabled = config.auto_approve_verified_peers === true;
+    const minVersion = config.auto_approve_min_protocol_version || '1.2.0';
+    const peerProtocolVersion = body.protocol_version || '0.0.0';
+
+    if (autoApproveEnabled && peerProtocolVersion >= minVersion) {
+      trustLevel = 'trusted';
+      autoApproved = true;
+    }
+
     const existing = db.prepare(
       'SELECT trust_level FROM myr_peers WHERE public_key = ?'
     ).get(peerKey);
 
     if (existing) {
-      // Already in DB — update URL and ensure trusted (handles pending→trusted upgrade too).
       db.prepare(
-        'UPDATE myr_peers SET peer_url = ?, operator_name = ?, trust_level = ?, approved_at = ? WHERE public_key = ?'
-      ).run(body.peer_url, body.operator_name, 'trusted', now, peerKey);
+        'UPDATE myr_peers SET peer_url = ?, operator_name = ?, trust_level = ?, approved_at = ?, verification_evidence = ?, auto_approved = ?, node_uuid = ? WHERE public_key = ?'
+      ).run(body.peer_url, body.operator_name, trustLevel, autoApproved ? now : null, JSON.stringify(evidence), autoApproved ? 1 : 0, body.node_uuid || null, peerKey);
     } else {
-      // First announce — auto-trust because they're in the signed registry.
       db.prepare(
-        'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, approved_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ).run(body.peer_url, body.operator_name, peerKey, 'trusted', now, now);
+        'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, approved_at, verification_evidence, auto_approved, node_uuid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run(body.peer_url, body.operator_name, peerKey, trustLevel, now, autoApproved ? now : null, JSON.stringify(evidence), autoApproved ? 1 : 0, body.node_uuid || null);
     }
 
     if (publicKeyHex) {
       writeTrace(db, {
-        eventType: 'introduce',
-        actorFingerprint: computeFingerprint(peerKey),
+        eventType: 'verify',
+        actorFingerprint: computedFromAnnounced,
         targetFingerprint: computeFingerprint(publicKeyHex),
         outcome: 'success',
-        metadata: { operator_name: body.operator_name, via: 'announce', existing: !!existing },
+        metadata: { ...evidence, auto_approved: autoApproved },
+      });
+    }
+
+    // Reciprocal announce: after auto-approve, announce ourselves to the peer
+    if (autoApproved && privateKeyHex) {
+      const reciprocalBody = {
+        peer_url: nodeUrl,
+        public_key: publicKeyHex,
+        operator_name: operatorName,
+        fingerprint: computeFingerprint(publicKeyHex),
+        node_uuid: config.node_uuid || null,
+        protocol_version: '1.2.0',
+        timestamp: new Date().toISOString(),
+        nonce: crypto.randomBytes(32).toString('hex'),
+      };
+      const reciprocalHeaders = makeSignedHeaders({
+        method: 'POST',
+        urlPath: '/myr/peers/announce',
+        body: reciprocalBody,
+        privateKey: privateKeyHex,
+        publicKey: publicKeyHex,
+      });
+
+      const reciprocalUrl = body.peer_url.replace(/\/+$/, '') + '/myr/peers/announce';
+      // Fire-and-forget with 5s timeout — do not block the response
+      const fetchPromise = httpFetch(reciprocalUrl, {
+        method: 'POST',
+        headers: reciprocalHeaders,
+        body: reciprocalBody,
+      });
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Reciprocal announce timeout (5s)')), 5000)
+      );
+      Promise.race([fetchPromise, timeoutPromise]).catch((err) => {
+        console.error(`Reciprocal announce to ${body.peer_url} failed: ${err.message}`);
       });
     }
 
     return res.json({
-      status: 'connected',
+      status: autoApproved ? 'connected' : 'verified',
       our_public_key: publicKeyHex,
-      message: 'Registry member recognized. Connection confirmed.',
-      approval_required: false,
+      message: autoApproved
+        ? 'Fingerprint verified. Auto-approved. Connection confirmed.'
+        : 'Fingerprint verified. Pending manual approval.',
+      trust_level: trustLevel,
+      verification_status: 'verified',
+      auto_approved: autoApproved,
     });
   });
 

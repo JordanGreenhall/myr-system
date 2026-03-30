@@ -141,7 +141,7 @@ describe('GET /.well-known/myr-node', () => {
   it('returns 200 with correct JSON structure', async () => {
     const { status, body } = await get(port, '/.well-known/myr-node');
     assert.equal(status, 200);
-    assert.equal(body.protocol_version, '1.0.0');
+    assert.equal(body.protocol_version, '1.2.0');
     assert.equal(body.node_url, 'https://test.myr.network');
     assert.equal(body.operator_name, 'testoperator');
     assert.equal(body.public_key, TEST_PUBLIC_KEY);

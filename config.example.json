@@ -5,5 +5,7 @@
   "keys_path": "./keys/",
   "export_path": "./exports/",
   "import_path": "./imports/",
-  "peers": []
+  "peers": [],
+  "auto_approve_verified_peers": false,
+  "auto_approve_min_protocol_version": "1.2.0"
 }
