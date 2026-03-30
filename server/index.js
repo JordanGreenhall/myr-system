@@ -130,6 +130,16 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         'Node configuration invalid', 'Missing operator_name in config');
     }
 
+    // Build network_eligibility block
+    const myrCount = safeCount(db, 'SELECT COUNT(*) FROM myr_reports WHERE share_network=1');
+    let avgRating = null;
+    try {
+      const row = db.prepare('SELECT AVG(operator_rating) as avg FROM myr_reports WHERE operator_rating IS NOT NULL').get();
+      if (row && row.avg !== null) avgRating = Math.round(row.avg * 100) / 100;
+    } catch {
+      // column may not exist — leave null
+    }
+
     res.json({
       protocol_version: '1.2.0',
       node_url: nodeUrl,
@@ -142,6 +152,13 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       rate_limits: {
         requests_per_minute: 60,
         min_sync_interval_minutes: 15,
+      },
+      network_eligibility: {
+        eligible: true,
+        myr_count: myrCount,
+        avg_rating: avgRating,
+        reviewed_count: 0,
+        computed_at: new Date().toISOString(),
       },
     });
   });

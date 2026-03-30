@@ -23,6 +23,7 @@ const { sign, fingerprint: computeFingerprint } = require('../lib/crypto');
 const { syncPeer: syncPeerCore, makeSignedHeaders, httpFetch, cleanupNonces } = require('../lib/sync');
 const { TOPIC_NAME, discoverPeers, startBackgroundAnnounce } = require('../lib/dht');
 const { verifyNode } = require('../lib/liveness');
+const { verifyPeerFingerprint } = require('../lib/verify');
 
 // --- Key loading helpers ---
 
@@ -234,6 +235,107 @@ async function syncPeer({ db, peerName, keys, fetch: fetchFn }) {
 async function nodeVerify({ url, fetchFn, timeoutMs }) {
   const baseUrl = url.replace(/\/$/, '');
   return verifyNode(baseUrl, { fetchFn, timeoutMs });
+}
+
+/**
+ * Announce ourselves to a remote peer via POST /myr/peers/announce.
+ *
+ * @param {object} opts
+ * @param {object} opts.db - Database instance
+ * @param {object} opts.config - Node config
+ * @param {string} opts.target - node_id (looked up in myr_peers) or a URL
+ * @param {object} opts.keys - { publicKey, privateKey } hex strings
+ * @param {Function} [opts.fetch] - Override fetch (for testing)
+ * @returns {Promise<{ status: string, message: string, trust_level?: string }>}
+ */
+async function announceTo({ db, config, target, keys, fetch: fetchFn }) {
+  fetchFn = fetchFn || httpFetch;
+
+  // Resolve target to a URL
+  let peerUrl;
+  if (target.startsWith('http://') || target.startsWith('https://')) {
+    peerUrl = target;
+  } else {
+    const peer = findPeer(db, target);
+    if (!peer) throw new Error(`No peer found matching "${target}"`);
+    if (!peer.peer_url) throw new Error(`Peer "${peer.operator_name}" has no peer_url configured`);
+    peerUrl = peer.peer_url;
+  }
+
+  const baseUrl = peerUrl.replace(/\/+$/, '');
+  const ourOperatorName = config.operator_name || config.node_name;
+  const ourNodeUrl = config.node_url || `http://localhost:${config.port || 3719}`;
+  const fp = computeFingerprint(keys.publicKey);
+  const timestamp = new Date().toISOString();
+  const nonce = nodeCrypto.randomBytes(32).toString('hex');
+
+  const announceBody = {
+    peer_url: ourNodeUrl,
+    public_key: keys.publicKey,
+    operator_name: ourOperatorName,
+    fingerprint: fp,
+    node_uuid: config.node_uuid || null,
+    protocol_version: '1.2.0',
+    timestamp,
+    nonce,
+  };
+
+  const signedHeaders = makeSignedHeaders({
+    method: 'POST',
+    urlPath: '/myr/peers/announce',
+    body: announceBody,
+    privateKey: keys.privateKey,
+    publicKey: keys.publicKey,
+  });
+
+  const res = await fetchFn(baseUrl + '/myr/peers/announce', {
+    method: 'POST',
+    headers: { ...signedHeaders, 'content-type': 'application/json' },
+    body: announceBody,
+  });
+
+  if (res.status !== 200) {
+    const msg = res.body && res.body.message ? res.body.message : `HTTP ${res.status}`;
+    throw new Error(`Announce failed: ${msg}`);
+  }
+
+  return {
+    status: res.body.status,
+    message: res.body.message || res.body.status,
+    trust_level: res.body.trust_level,
+  };
+}
+
+/**
+ * Verify a known peer's identity via 3-way fingerprint check.
+ * Read-only diagnostic — does NOT change trust_level.
+ *
+ * @param {object} opts
+ * @param {object} opts.db - Database instance
+ * @param {string} opts.target - node_id, operator_name, or public_key prefix
+ * @param {Function} [opts.fetchFn] - Override fetch (for testing)
+ * @returns {Promise<{ verified: boolean, operator_name: string, fingerprint: string, reason?: string }>}
+ */
+async function verifyPeer({ db, target, fetchFn }) {
+  const peer = findPeer(db, target);
+  if (!peer) throw new Error(`No peer found matching "${target}"`);
+  if (!peer.peer_url) throw new Error(`Peer "${peer.operator_name}" has no peer_url configured`);
+
+  const fp = computeFingerprint(peer.public_key);
+  const result = await verifyPeerFingerprint({
+    publicKey: peer.public_key,
+    fingerprint: fp,
+    peerUrl: peer.peer_url,
+    fetchFn,
+  });
+
+  return {
+    verified: result.verified,
+    operator_name: peer.operator_name,
+    fingerprint: fp,
+    reason: result.reason,
+    evidence: result.evidence,
+  };
 }
 
 // --- DB helper for new ~/.myr config format ---
@@ -566,6 +668,97 @@ if (require.main === module) {
       }
     });
 
+  // myr peer reject <fingerprint>
+  peerCmd
+    .command('reject <fingerprint>')
+    .description('Reject a peer (by fingerprint or name)')
+    .action((fingerprint) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error('Node not configured. Run: myr setup');
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        db = getDbFromNodeConfig(nodeConfig);
+        const result = rejectPeer({ db, identifier: fingerprint });
+        console.log(result.message);
+      } catch (err) {
+        console.error(err.message);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
+  // ── myr announce-to ────────────────────────────────────────────────────────
+  program
+    .command('announce-to <target>')
+    .description('Announce ourselves to a peer (by node_id/name or URL)')
+    .action(async (target) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error('Node not configured. Run: myr setup');
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        db = getDbFromNodeConfig(nodeConfig);
+        const keys = loadKeypair(nodeConfig);
+        const result = await announceTo({ db, config: nodeConfig, target, keys });
+
+        if (result.status === 'connected') {
+          console.log(`✓ Connected: ${result.message}`);
+        } else if (result.status === 'verified') {
+          console.log(`✓ Verified (pending approval): ${result.message}`);
+        } else if (result.status === 'pending') {
+          console.log(`⏳ Pending: ${result.message}`);
+        } else if (result.status === 'rejected') {
+          console.log(`✗ Rejected: ${result.message}`);
+          process.exit(1);
+        } else {
+          console.log(`${result.status}: ${result.message}`);
+        }
+      } catch (err) {
+        console.error(`✗ Announce failed: ${err.message}`);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
+  // ── myr verify-peer ────────────────────────────────────────────────────────
+  program
+    .command('verify-peer <target>')
+    .description('Verify a known peer via 3-way fingerprint check (read-only)')
+    .action(async (target) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error('Node not configured. Run: myr setup');
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        db = getDbFromNodeConfig(nodeConfig);
+        const result = await verifyPeer({ db, target });
+
+        if (result.verified) {
+          console.log(`✓ Peer verified: ${result.operator_name} | fingerprint: ${result.fingerprint} | all 3 checks passed`);
+        } else {
+          console.log(`✗ Verification failed: ${result.reason}`);
+          process.exit(1);
+        }
+      } catch (err) {
+        console.error(`✗ Verification failed: ${err.message}`);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
   // ── myr sync ────────────────────────────────────────────────────────────────
   program
     .command('sync')
@@ -804,6 +997,8 @@ module.exports = {
   getPeerFingerprint,
   syncPeer,
   nodeVerify,
+  announceTo,
+  verifyPeer,
   makeSignedHeaders,
   httpFetch,
   loadKeypair,

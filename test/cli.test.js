@@ -17,6 +17,8 @@ const {
   getPeerFingerprint,
   syncPeer,
   nodeVerify,
+  announceTo,
+  verifyPeer,
 } = require('../bin/myr');
 
 function createTestDb() {
@@ -51,12 +53,15 @@ function createTestDb() {
       peer_url TEXT UNIQUE NOT NULL,
       operator_name TEXT NOT NULL,
       public_key TEXT UNIQUE NOT NULL,
-      trust_level TEXT CHECK(trust_level IN ('trusted', 'pending', 'introduced', 'revoked', 'rejected')) DEFAULT 'pending',
+      trust_level TEXT CHECK(trust_level IN ('trusted', 'pending', 'introduced', 'revoked', 'rejected', 'verified-pending-approval')) DEFAULT 'pending',
       added_at TEXT NOT NULL,
       approved_at TEXT,
       last_sync_at TEXT,
       auto_sync INTEGER DEFAULT 1,
-      notes TEXT
+      notes TEXT,
+      node_uuid TEXT,
+      verification_evidence TEXT,
+      auto_approved INTEGER DEFAULT 0
     );
 
     CREATE TABLE myr_nonces (
@@ -675,5 +680,196 @@ describe('nodeVerify', () => {
     });
     assert.equal(result.verified, false);
     assert.ok(result.reason.includes('stale'), `Expected 'stale' in reason, got: ${result.reason}`);
+  });
+});
+
+// ---------- announceTo ----------
+
+describe('announceTo', () => {
+  let peerServer, peerPort, peerDb, peerKeys;
+  let ourServer, ourPort, ourDb;
+  let cliDb;
+  const ourKeys = generateKeypair();
+
+  before(() => {
+    peerKeys = generateKeypair();
+    peerDb = createTestDb();
+    ourDb = createTestDb();
+    cliDb = createTestDb();
+
+    // Set up peer server with auto-approve enabled
+    const peerApp = createApp({
+      config: {
+        node_id: 'announce-peer',
+        operator_name: 'announce-target',
+        node_url: 'http://localhost',
+        port: 0,
+        auto_approve_verified_peers: true,
+        auto_approve_min_protocol_version: '1.2.0',
+      },
+      db: peerDb,
+      publicKeyHex: peerKeys.publicKey,
+      privateKeyHex: peerKeys.privateKey,
+      createdAt: '2026-03-01T10:00:00Z',
+    });
+    peerServer = peerApp.listen(0);
+    peerPort = peerServer.address().port;
+
+    // Set up our own server so the peer can fetch our discovery doc
+    const ourApp = createApp({
+      config: {
+        node_id: 'our-node',
+        operator_name: 'test-announcer',
+        node_url: 'http://localhost',
+        port: 0,
+      },
+      db: ourDb,
+      publicKeyHex: ourKeys.publicKey,
+      privateKeyHex: ourKeys.privateKey,
+      createdAt: '2026-03-01T10:00:00Z',
+    });
+    ourServer = ourApp.listen(0);
+    ourPort = ourServer.address().port;
+  });
+
+  after(() => {
+    peerServer.close();
+    ourServer.close();
+    peerDb.close();
+    ourDb.close();
+    cliDb.close();
+  });
+
+  it('happy path: announce to URL, get connected/verified', async () => {
+    const result = await announceTo({
+      db: cliDb,
+      config: {
+        operator_name: 'test-announcer',
+        node_url: `http://localhost:${ourPort}`,
+        port: ourPort,
+        node_uuid: 'test-uuid-123',
+      },
+      target: `http://localhost:${peerPort}`,
+      keys: ourKeys,
+    });
+
+    assert.ok(result.status);
+    assert.ok(['connected', 'verified', 'pending'].includes(result.status),
+      `Expected connected/verified/pending, got: ${result.status}`);
+  });
+
+  it('announce to known peer by name', async () => {
+    // Register the peer in our DB first
+    cliDb.prepare(
+      'INSERT OR IGNORE INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(`http://localhost:${peerPort}`, 'announce-target', peerKeys.publicKey, 'pending', new Date().toISOString());
+
+    const result = await announceTo({
+      db: cliDb,
+      config: {
+        operator_name: 'test-announcer',
+        node_url: `http://localhost:${ourPort}`,
+        port: ourPort,
+      },
+      target: 'announce-target',
+      keys: ourKeys,
+    });
+
+    assert.ok(result.status);
+  });
+
+  it('throws for unknown peer name', async () => {
+    await assert.rejects(
+      () => announceTo({
+        db: cliDb,
+        config: { operator_name: 'test', node_url: 'http://localhost:9999' },
+        target: 'nonexistent-peer',
+        keys: ourKeys,
+      }),
+      /No peer found/
+    );
+  });
+});
+
+// ---------- verifyPeer ----------
+
+describe('verifyPeer', () => {
+  let peerServer, peerPort, peerDb, peerKeys, cliDb;
+
+  before(() => {
+    peerKeys = generateKeypair();
+    peerDb = createTestDb();
+    cliDb = createTestDb();
+
+    const peerApp = createApp({
+      config: {
+        node_id: 'verify-peer-node',
+        operator_name: 'verify-target',
+        node_url: 'http://localhost',
+        port: 0,
+      },
+      db: peerDb,
+      publicKeyHex: peerKeys.publicKey,
+      createdAt: '2026-03-01T10:00:00Z',
+    });
+    peerServer = peerApp.listen(0);
+    peerPort = peerServer.address().port;
+
+    // Register peer in our DB with matching key
+    cliDb.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(`http://localhost:${peerPort}`, 'verify-target', peerKeys.publicKey, 'pending', new Date().toISOString());
+  });
+
+  after(() => {
+    peerServer.close();
+    peerDb.close();
+    cliDb.close();
+  });
+
+  it('happy path: all 3 checks pass', async () => {
+    const result = await verifyPeer({
+      db: cliDb,
+      target: 'verify-target',
+    });
+
+    assert.equal(result.verified, true);
+    assert.equal(result.operator_name, 'verify-target');
+    assert.ok(result.fingerprint.startsWith('SHA-256:'));
+  });
+
+  it('fails when discovery returns different key', async () => {
+    const otherKeys = generateKeypair();
+    const badKeys = generateKeypair();
+
+    // Use a separate in-memory DB to avoid UNIQUE conflicts
+    const db2 = createTestDb();
+    db2.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run('http://fake-peer:3719', 'fake-peer', otherKeys.publicKey, 'pending', new Date().toISOString());
+
+    // Mock fetch returns a discovery doc with a different key
+    const mockFetchFn = async () => ({
+      public_key: badKeys.publicKey,
+      fingerprint: computeFingerprint(badKeys.publicKey),
+      operator_name: 'fake-peer',
+    });
+
+    const result = await verifyPeer({
+      db: db2,
+      target: 'fake-peer',
+      fetchFn: mockFetchFn,
+    });
+
+    assert.equal(result.verified, false);
+    assert.ok(result.reason, 'Expected a failure reason');
+    db2.close();
+  });
+
+  it('throws for unknown peer', async () => {
+    await assert.rejects(
+      () => verifyPeer({ db: cliDb, target: 'nobody' }),
+      /No peer found/
+    );
   });
 });
