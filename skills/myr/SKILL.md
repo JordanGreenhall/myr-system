@@ -1,7 +1,7 @@
 ---
 name: myr
-version: 1.1.0
-description: Capture, search, verify, export, import, and synthesize Methodological Yield Reports (MYRs) for OODA-based intelligence compounding. Use when: (1) installing MYR on a node, (2) storing yield from OODA cycles, (3) searching prior yield before new work, (4) operator-reviewing MYR quality, (5) exporting/importing signed MYRs between nodes, (6) running the HTTP server for live peer sync, (7) managing network peers, (8) generating weekly digests, or (9) integrating MYR with an agent memory system. Triggers: "install MYR", "store a MYR", "what did we learn about", "weekly yield", "export yield", "import yield", "methodological yield", "MYR", "peer sync", "start MYR server".
+version: 1.2.0
+description: Capture, search, verify, export, import, and synthesize Methodological Yield Reports (MYRs) for OODA-based intelligence compounding. Use when: (1) installing MYR on a node, (2) storing yield from OODA cycles, (3) searching prior yield before new work, (4) operator-reviewing MYR quality, (5) exporting/importing signed MYRs between nodes, (6) running the HTTP server for live peer sync, (7) managing network peers, (8) verifying remote peers, (9) generating weekly digests, (10) integrating MYR with an agent memory system, or (11) configuring auto-approval for verified peers. Triggers: "install MYR", "store a MYR", "what did we learn about", "weekly yield", "export yield", "import yield", "methodological yield", "MYR", "peer sync", "start MYR server", "verify peer", "announce to peer".
 ---
 
 # MYR — Methodological Yield Reports
@@ -242,6 +242,48 @@ COMMIT;
 6. **Ask peer to approve you** — they run the same steps from their side
 7. **Verify sync:** `node bin/myr.js sync <peer-node-id>` — should return reports
 8. **Mark your reports shareable** (see above) so peers can pull from you
+
+---
+
+## Peer Verification (v1.2.0)
+
+MYR v1.2.0 introduces in-band fingerprint verification during the announce flow. When a peer announces to your node, a 3-way check runs automatically:
+
+1. The announced fingerprint matches the fingerprint computed from the announced public key.
+2. The peer's discovery document is fetched from their URL.
+3. The discovery document fingerprint matches both the announced and computed fingerprints.
+
+Peers passing all three checks are marked `verified-pending-approval`. Peers failing any check are `rejected` with evidence stored for audit.
+
+### Verify a remote peer (CLI)
+
+```bash
+node $MYR_HOME/bin/myr.js node verify --url <peer-url>
+```
+
+Returns verified status, operator name, fingerprint, and latency. Exit code 1 on failure.
+
+### Announce to a peer
+
+When adding a peer with `myr peer add --url <url>`, MYR fetches the peer's discovery document and sends an introduce request. In v1.2.0, the announce body includes `fingerprint`, `node_uuid`, and `protocol_version` fields for in-band verification.
+
+### Auto-approve verified peers
+
+Set `auto_approve_verified_peers: true` in your node config (`~/.myr/config.json` or `config.json`) to automatically trust peers that pass 3-way fingerprint verification:
+
+```json
+{
+  "auto_approve_verified_peers": true,
+  "auto_approve_min_protocol_version": "1.2.0"
+}
+```
+
+When enabled:
+- Peers announcing with protocol version ≥ `auto_approve_min_protocol_version` (default `1.2.0`) that pass 3-way verification are immediately trusted.
+- A reciprocal announce is sent automatically so both sides can establish trust in a single round-trip.
+- The `auto_approved` flag is recorded in the peer record for audit.
+
+**Security note:** Only enable auto-approve on nodes where you trust the network environment. On untrusted networks, keep manual approval (`auto_approve_verified_peers: false`, the default) and verify fingerprints out-of-band.
 
 ---
 

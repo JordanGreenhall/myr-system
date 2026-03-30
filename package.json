@@ -1,6 +1,6 @@
 {
   "name": "myr-system",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Methodological Yield Reports — a pistis-native intelligence compounding system",
   "bin": {
     "myr": "./bin/myr.js"
