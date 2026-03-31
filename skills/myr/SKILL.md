@@ -20,6 +20,22 @@ For every MYR operation, return:
 
 ## Installation (New Node)
 
+### One-step install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JordanGreenhall/myr-system/main/install.sh | bash
+```
+
+This clones the repo, installs dependencies, generates your keypair, prompts for a node ID, runs the five-command ping test, and adds `MYR_HOME` to your shell. Node is operational when it completes.
+
+If you already have the repo cloned:
+
+```bash
+bash install.sh
+```
+
+### Manual install
+
 ```bash
 git clone https://github.com/JordanGreenhall/myr-system.git
 cd myr-system

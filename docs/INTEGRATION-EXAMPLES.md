@@ -80,6 +80,144 @@ try {
 - Every memory search automatically surfaces relevant MYR yield
 - The MYR system is invisible to agents — they use their existing tools
 
+---
+
+## Node 2 Reference Implementation (Hermes Agent + Python)
+
+This example shows MYR integration from a completely different stack: a Python-based agent running a Nous Research Hermes model (via Ollama or vLLM). No OpenClaw, no Node memory system, no PostgreSQL — just a Python agent loop calling MYR's CLI scripts as subprocesses.
+
+This is intentional. **MYR is system-agnostic.** If it only worked with OpenClaw's memory stack, it would be a plugin, not a protocol. Two reference implementations from two different systems makes that concrete.
+
+### Environment
+
+- Python 3.11+ agent using `ollama` Python library with `NousResearch/Hermes-3-Llama-3.1-8B`
+- No external memory system — the agent uses in-context history
+- MYR node cloned at `/home/user/myr-system`, `MYR_HOME` set in environment
+
+### How it works
+
+**Capture (agent loop → subprocess):**
+
+When the Hermes agent completes a research or reasoning cycle, it checks whether the output contains a lesson, falsification, or technique worth persisting. If so, it calls `myr-store.js` via subprocess before yielding its response.
+
+```python
+import subprocess
+import os
+import json
+
+MYR_HOME = os.environ.get("MYR_HOME", "/home/user/myr-system")
+
+def myr_store(intent: str, yield_type: str, question: str,
+              evidence: str, changes: str, tags: list[str],
+              agent: str = "hermes") -> bool:
+    """Fire-and-forget MYR capture. Returns True if store succeeded."""
+    try:
+        result = subprocess.run(
+            [
+                "node",
+                f"{MYR_HOME}/scripts/myr-store.js",
+                "--intent", intent,
+                "--type", yield_type,
+                "--question", question,
+                "--evidence", evidence,
+                "--changes", changes,
+                "--tags", ",".join(tags),
+                "--agent", agent,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False  # never fail the agent loop
+
+
+def myr_search(query: str, limit: int = 5) -> list[dict]:
+    """Query MYR before starting new work on a known domain."""
+    try:
+        result = subprocess.run(
+            [
+                "node",
+                f"{MYR_HOME}/scripts/myr-search.js",
+                "--query", query,
+                "--limit", str(limit),
+                "--json",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return json.loads(result.stdout)
+    except Exception:
+        pass
+    return []
+```
+
+**Agent loop integration:**
+
+```python
+import ollama
+
+def hermes_agent_turn(user_message: str, history: list[dict]) -> str:
+    # 1. Before research — recall prior yield
+    prior_yield = myr_search(user_message)
+    context_injection = ""
+    if prior_yield:
+        yield_text = "\n".join(
+            f"[MYR:{r['yield_type']}] {r['question_answered']}: {r['evidence']}"
+            for r in prior_yield[:3]
+        )
+        context_injection = f"\n\n<prior_yield>\n{yield_text}\n</prior_yield>"
+
+    messages = history + [
+        {"role": "user", "content": user_message + context_injection}
+    ]
+
+    response = ollama.chat(
+        model="hf.co/NousResearch/Hermes-3-Llama-3.1-8B-GGUF",
+        messages=messages,
+    )
+    reply = response["message"]["content"]
+
+    # 2. After reasoning — extract and store yield (heuristic)
+    if any(marker in reply.lower() for marker in
+           ["learned", "doesn't work", "discovered", "confirmed", "pattern:"]):
+        myr_store(
+            intent=user_message[:120],
+            yield_type="insight",
+            question=f"What did this cycle resolve about: {user_message[:80]}?",
+            evidence=reply[:300],
+            changes="Carry this forward in future cycles on this domain.",
+            tags=["hermes", "auto-captured"],
+            agent="hermes",
+        )
+
+    return reply
+```
+
+**Key design decisions:**
+
+1. **Subprocess, not import.** MYR is Node.js; the agent is Python. Subprocess keeps the boundary clean. No native bindings, no FFI — just stdin/stdout/exit codes.
+
+2. **Recall before action.** `myr_search` runs at the start of each turn for domain-relevant queries. The result is injected into the prompt as a `<prior_yield>` block. The Hermes model sees prior network yield as context, not as a tool result.
+
+3. **Heuristic capture.** The agent doesn't require an explicit "store this" command. A simple keyword heuristic flags likely yield-bearing turns. False positives are filtered at operator review (`myr-verify.js`). This trades precision for consistency.
+
+4. **Fire-and-forget.** Capture runs in a subprocess with a 10-second timeout. If MYR is unavailable (disk full, DB locked, wrong path), the agent loop continues. The user never sees a MYR error.
+
+5. **Attribution flows naturally.** The `--agent hermes` tag means all yield from this node is traceable back to the Hermes agent, not the operator. Cross-node synthesis (`myr-synthesize.js`) can isolate Hermes-sourced findings.
+
+### What this achieves
+
+- A Hermes agent on a Python stack compounds yield across sessions without learning new habits
+- The agent recalls network yield from other nodes (including OpenClaw nodes) before starting work
+- MYR's trust and signing properties apply identically — no special treatment for Python or Hermes
+- A new network participant can set up this integration in ~20 lines of Python
+
+---
+
 ## Adapting to Your Environment
 
 The pattern is:

@@ -6,13 +6,26 @@ Single-node capture and search. Multi-node signed artifact exchange via Ed25519.
 
 ## Install
 
+### One-step (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JordanGreenhall/myr-system/main/install.sh | bash
+```
+
+Clones, installs deps, generates keypair, sets node ID, runs ping test. Node is operational when it completes.
+
+Already have the repo? `bash install.sh`
+
+### Manual
+
 ```bash
 git clone https://github.com/JordanGreenhall/myr-system.git
 cd myr-system
 npm install
 cp config.example.json config.json
-# Edit config.json — set your node_id
+# Edit config.json — set your node_id (not "n1")
 node scripts/myr-keygen.js
+export MYR_HOME=$(pwd)
 ```
 
 ## Quick Start
@@ -98,7 +111,12 @@ If all five commands succeed, the node is operational.
 
 ## Integration with Agent Memory Systems
 
-MYR can be wired into existing agent memory systems so yield capture is automatic — no new habit required. See `docs/INTEGRATION-EXAMPLES.md` for a reference implementation showing how Node 1 (the first network node) solved this.
+MYR can be wired into existing agent memory systems so yield capture is automatic — no new habit required. See `docs/INTEGRATION-EXAMPLES.md` for two reference implementations:
+
+- **Node 1 (OpenClaw + PostgreSQL + Ollama):** Node.js hook into an existing memory-store pipeline
+- **Node 2 (Hermes agent + Python):** Python subprocess integration with a Nous Research Hermes model — no OpenClaw, no shared memory stack
+
+Two implementations from two different systems. MYR is not OpenClaw-specific.
 
 **Environment variable:** Set `MYR_HOME` to the absolute path of your myr-system installation. Agent scripts that integrate with MYR use this to locate the system.
 
