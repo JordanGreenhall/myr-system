@@ -1,6 +1,6 @@
 ---
 name: myr
-version: 1.2.0
+version: 1.3.0
 description: Capture, search, verify, export, import, and synthesize Methodological Yield Reports (MYRs) for OODA-based intelligence compounding. Use when: (1) installing MYR on a node, (2) storing yield from OODA cycles, (3) searching prior yield before new work, (4) operator-reviewing MYR quality, (5) exporting/importing signed MYRs between nodes, (6) running the HTTP server for live peer sync, (7) managing network peers, (8) verifying remote peers, (9) generating weekly digests, (10) integrating MYR with an agent memory system, or (11) configuring auto-approval for verified peers. Triggers: "install MYR", "store a MYR", "what did we learn about", "weekly yield", "export yield", "import yield", "methodological yield", "MYR", "peer sync", "start MYR server", "verify peer", "announce to peer".
 ---
 
