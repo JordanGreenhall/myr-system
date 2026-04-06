@@ -1,9 +1,12 @@
 {
   "node_id": "nX",
   "node_name": "Node X - Name",
+  "node_url": "",
+  "node_uuid": "",
   "db_path": "./db/myr.db",
   "keys_path": "./keys/",
   "export_path": "./exports/",
   "import_path": "./imports/",
+  "registry_version": 1,
   "peers": []
 }

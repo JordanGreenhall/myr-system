@@ -33,6 +33,15 @@ Types: `technique` (reusable method), `insight` (orientation shift), `falsificat
 
 Or use `--interactive` for guided prompts, or `--stdin` for piped JSON.
 
+### Auto-draft from agent memory events
+
+```bash
+node scripts/myr-draft.js --label "event label" --content "event content" \
+  --category "category" --agent "agent-name" --tags "tag1,tag2"
+```
+
+Called as a fire-and-forget child process by memory-store.js. Uses local Ollama (llama3.1:8b) to extract structured MYR fields from a memory event and store a draft. Failures are silent so the parent process is never affected.
+
 ### Search prior yield
 
 ```bash
@@ -58,6 +67,14 @@ node scripts/myr-weekly.js
 
 ## Cross-Node Operations
 
+### Show node identity
+
+```bash
+node scripts/myr-identity.js
+```
+
+Prints this node's identity card: node_id, node_uuid, and public key fingerprint. Share this with peers before exchanging MYR packages.
+
 ### Export signed artifacts
 
 ```bash
@@ -73,6 +90,39 @@ node scripts/myr-import.js --file ./imports/peer-export.myr.json --peer-key ./ke
 ```
 
 Verifies signatures, rejects duplicates and tampered artifacts.
+
+### Sync from all trusted peers
+
+```bash
+node scripts/myr-sync-all.js
+```
+
+Syncs verified MYRs from all peers marked `auto_sync=1` and `trust_level='trusted'` via peer-to-peer exchange.
+
+### Sync from a single peer
+
+```bash
+node scripts/myr-sync-peer.js <peer_name>
+```
+
+Syncs verified MYRs from a specific peer by operator name.
+
+### Sync registry
+
+```bash
+node scripts/myr-sync-registry.js
+```
+
+Fetches the signed node registry and revocation list from GitHub, verifies Ed25519 signatures, applies replay protection, upserts new peers, and applies revocations.
+
+### Sign the network registry (operator only)
+
+```bash
+node scripts/myr-registry-sign.js --nodes network/nodes.json
+node scripts/myr-registry-sign.js --revoked network/revoked.json
+```
+
+Signs or updates the MYR node registry and revocation list with the network operator key. Bumps version and re-signs canonical JSON.
 
 ### Cross-node synthesis
 
@@ -110,10 +160,13 @@ MYR can be wired into existing agent memory systems so yield capture is automati
 |-------|---------|-------------|
 | `node_id` | `nX` | `MYR_NODE_ID` |
 | `node_name` | `""` | `MYR_NODE_NAME` |
+| `node_url` | `""` | — |
+| `node_uuid` | `""` | — |
 | `db_path` | `./db/myr.db` | `MYR_DB_PATH` |
 | `keys_path` | `./keys/` | — |
 | `export_path` | `./exports/` | — |
 | `import_path` | `./imports/` | — |
+| `registry_version` | `1` | — |
 
 ## File Structure
 
@@ -129,11 +182,16 @@ myr-system/
 │   ├── myr-weekly.js        ← weekly digest
 │   ├── myr-verify.js        ← operator review
 │   ├── myr-draft.js         ← auto-draft from memory events
+│   ├── myr-identity.js      ← print node identity card
 │   ├── myr-keygen.js        ← Ed25519 keypair
 │   ├── myr-sign.js          ← sign artifacts
 │   ├── myr-export.js        ← export signed artifacts
 │   ├── myr-import.js        ← import + verify peer artifacts
-│   └── myr-synthesize.js    ← cross-node synthesis
+│   ├── myr-synthesize.js    ← cross-node synthesis
+│   ├── myr-registry-sign.js ← sign network registry (operator)
+│   ├── myr-sync-all.js      ← sync from all trusted peers
+│   ├── myr-sync-peer.js     ← sync from a single peer
+│   └── myr-sync-registry.js ← fetch + verify node registry
 ├── db/                      ← SQLite (gitignored)
 ├── keys/                    ← keypairs (gitignored)
 ├── exports/                 ← signed exports (gitignored)
