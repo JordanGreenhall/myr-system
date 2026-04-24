@@ -1,16 +1,16 @@
 # MYR Readiness Evidence Report
 
-**Collected:** 2026-04-24T20:19:33Z
+**Collected:** 2026-04-24T20:23:15Z
 **Version:** v1.3.3
-**Recommendation:** **GO** — All checks passed (8 pass, 2 warnings)
+**Recommendation:** **GO** — All checks passed (9 pass, 1 warnings)
 
 ## Summary
 
 | Result | Count |
 |--------|-------|
-| PASS | 8 |
+| PASS | 9 |
 | FAIL | 0 |
-| WARN | 2 |
+| WARN | 1 |
 | **Total** | **10** |
 
 ## Check Details
@@ -19,7 +19,7 @@
 |-------|--------|--------|
 | regression_tests | PASS | 539/539 tests, 166 suites, 0 failures |
 | release_acceptance | PASS | Release acceptance tests passed |
-| git_clean | WARN | 3 uncommitted changes |
+| git_clean | PASS | Working tree is clean |
 | package_version | PASS | v1.3.3 |
 | git_tag | PASS | Latest tag: v1.3.3 |
 | documentation | PASS | All 11 required docs present |
