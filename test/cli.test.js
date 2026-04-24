@@ -12,14 +12,25 @@ const {
   addPeer,
   approvePeer,
   rejectPeer,
+  revokePeerGovernance,
+  quarantineYield,
+  governanceAudit,
   listPeers,
   getFingerprint,
   getPeerFingerprint,
   syncPeer,
+  inferTargetDomains,
+  routePeersForSync,
   nodeVerify,
   announceTo,
   verifyPeer,
+  publishSubscription,
+  makeInviteUrl,
+  parseInviteUrl,
+  parseDurationMs,
+  getAutoSyncSettings,
 } = require('../bin/myr');
+const { recall } = require('../lib/recall');
 
 function createTestDb() {
   const db = new Database(':memory:');
@@ -34,10 +45,12 @@ function createTestDb() {
       session_ref TEXT,
       cycle_intent TEXT NOT NULL,
       domain_tags TEXT NOT NULL,
+      cycle_context TEXT,
       yield_type TEXT NOT NULL,
       question_answered TEXT NOT NULL,
       evidence TEXT NOT NULL,
       what_changes_next TEXT NOT NULL,
+      what_was_falsified TEXT,
       confidence REAL NOT NULL DEFAULT 0.7,
       operator_rating INTEGER,
       created_at TEXT NOT NULL,
@@ -70,6 +83,47 @@ function createTestDb() {
       expires_at TEXT NOT NULL
     );
     CREATE INDEX idx_nonces_expires ON myr_nonces(expires_at);
+
+    CREATE TABLE myr_traces (
+      trace_id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      event_type TEXT NOT NULL CHECK(event_type IN ('introduce','approve','share','sync_pull','sync_push','verify','reject','discover','relay_sync','revoke','quarantine','stage_change')),
+      actor_fingerprint TEXT NOT NULL,
+      target_fingerprint TEXT,
+      artifact_signature TEXT,
+      outcome TEXT NOT NULL CHECK(outcome IN ('success','failure','rejected')),
+      rejection_reason TEXT,
+      metadata TEXT DEFAULT '{}'
+    );
+
+    CREATE TABLE myr_quarantined_yields (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      yield_id TEXT NOT NULL UNIQUE,
+      quarantined_at TEXT NOT NULL,
+      quarantined_by TEXT NOT NULL,
+      operator_signature TEXT NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','released')),
+      metadata TEXT DEFAULT '{}'
+    );
+
+    CREATE VIRTUAL TABLE myr_fts USING fts5(
+      id,
+      cycle_intent,
+      cycle_context,
+      question_answered,
+      evidence,
+      what_changes_next,
+      what_was_falsified,
+      domain_tags,
+      content=myr_reports,
+      content_rowid=rowid
+    );
+
+    CREATE TRIGGER myr_fts_insert AFTER INSERT ON myr_reports BEGIN
+      INSERT INTO myr_fts(rowid, id, cycle_intent, cycle_context, question_answered, evidence, what_changes_next, what_was_falsified, domain_tags)
+      VALUES (new.rowid, new.id, new.cycle_intent, new.cycle_context, new.question_answered, new.evidence, new.what_changes_next, new.what_was_falsified, new.domain_tags);
+    END;
   `);
 
   return db;
@@ -83,6 +137,85 @@ function seedPeers(db) {
   insert.run('https://jared.myr.network', 'jared', 'bb'.repeat(32), 'pending', '2026-03-01T08:00:00Z', null);
   insert.run('https://eve.myr.network', 'eve', 'cc'.repeat(32), 'rejected', '2026-02-27T08:00:00Z', null);
 }
+
+function decodeInvite(inviteUrl) {
+  const token = inviteUrl.replace('myr://invite/', '');
+  const normalized = token.replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+  return JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+}
+
+function encodeInvite(payload) {
+  const token = Buffer.from(JSON.stringify(payload), 'utf8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+  return `myr://invite/${token}`;
+}
+
+describe('invite tokens', () => {
+  it('creates a signed invite URL and parses it', () => {
+    const keys = generateKeypair();
+    const inviteUrl = makeInviteUrl({
+      nodeConfig: { node_url: 'https://alpha.myr.network', operator_name: 'alpha' },
+      keys,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      token: 'nonce-1',
+    });
+
+    const payload = parseInviteUrl(inviteUrl);
+    assert.equal(payload.node_url, 'https://alpha.myr.network');
+    assert.equal(payload.operator_name, 'alpha');
+    assert.equal(payload.public_key, keys.publicKey);
+    assert.equal(payload.fingerprint, computeFingerprint(keys.publicKey));
+    assert.ok(payload.sig);
+  });
+
+  it('rejects tampered payload content', () => {
+    const keys = generateKeypair();
+    const inviteUrl = makeInviteUrl({
+      nodeConfig: { node_url: 'https://alpha.myr.network', operator_name: 'alpha' },
+      keys,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      token: 'nonce-2',
+    });
+
+    const payload = decodeInvite(inviteUrl);
+    payload.operator_name = 'mallory';
+    const tampered = encodeInvite(payload);
+
+    assert.throws(() => parseInviteUrl(tampered), /signature verification failed/);
+  });
+
+  it('rejects fingerprint and key mismatch', () => {
+    const keys = generateKeypair();
+    const inviteUrl = makeInviteUrl({
+      nodeConfig: { node_url: 'https://alpha.myr.network', operator_name: 'alpha' },
+      keys,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      token: 'nonce-3',
+    });
+
+    const payload = decodeInvite(inviteUrl);
+    payload.fingerprint = 'SHA-256:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00';
+    const tampered = encodeInvite(payload);
+
+    assert.throws(() => parseInviteUrl(tampered), /fingerprint does not match public key/);
+  });
+
+  it('rejects expired invites', () => {
+    const keys = generateKeypair();
+    const inviteUrl = makeInviteUrl({
+      nodeConfig: { node_url: 'https://alpha.myr.network', operator_name: 'alpha' },
+      keys,
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      token: 'nonce-4',
+    });
+
+    assert.throws(() => parseInviteUrl(inviteUrl), /Invite expired at/);
+  });
+});
 
 // ---------- findPeer ----------
 
@@ -168,6 +301,71 @@ describe('rejectPeer', () => {
 
   it('throws for unknown peer', () => {
     assert.throws(() => rejectPeer({ db, identifier: 'nobody' }), /No peer found/);
+  });
+});
+
+describe('governance interventions', () => {
+  let db;
+  const keys = generateKeypair();
+
+  before(() => {
+    db = createTestDb();
+    seedPeers(db);
+    db.prepare(`
+      INSERT INTO myr_reports (
+        id, timestamp, agent_id, node_id, cycle_intent, domain_tags, cycle_context,
+        yield_type, question_answered, evidence, what_changes_next, what_was_falsified,
+        confidence, operator_rating, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'yield-001',
+      '2026-04-16T12:00:00Z',
+      'agent1',
+      'n1',
+      'Debug sync path',
+      '["networking","sync"]',
+      null,
+      'technique',
+      'How to reduce sync failures?',
+      'Use retry and jitter',
+      'Apply retry policy',
+      null,
+      0.8,
+      4,
+      '2026-04-16T12:00:00Z',
+      '2026-04-16T12:00:00Z'
+    );
+  });
+
+  after(() => db.close());
+
+  it('revoke sets peer trust_level=revoked so sync is blocked', async () => {
+    const revoked = revokePeerGovernance({ db, identifier: 'gary', keys });
+    assert.equal(revoked.peer.trust_level, 'revoked');
+
+    await assert.rejects(
+      () => syncPeer({ db, peerName: 'gary', keys }),
+      /not trusted \(status: revoked\)/
+    );
+  });
+
+  it('quarantine excludes yield from recall and appears in governance audit', () => {
+    const result = quarantineYield({
+      db,
+      yieldId: 'yield-001',
+      reason: 'manual review pending',
+      keys,
+    });
+    assert.equal(result.quarantine.yield_id, 'yield-001');
+    assert.equal(result.quarantine.status, 'active');
+
+    const recalled = recall(db, { intent: 'sync failures', tags: ['sync'] });
+    assert.ok(!recalled.results.some((r) => r.id === 'yield-001'));
+    assert.ok(!recalled.falsifications.some((r) => r.id === 'yield-001'));
+
+    const audit = governanceAudit({ db, limit: 50 });
+    assert.ok(audit.quarantines.length >= 1);
+    assert.ok(audit.quarantinedYields.some((q) => q.yield_id === 'yield-001'));
   });
 });
 
@@ -300,8 +498,8 @@ describe('addPeer', () => {
   it('announces us to the remote peer', () => {
     const remotePeer = peerDb.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(ourKeys.publicKey);
     assert.ok(remotePeer, 'remote should have stored our peer record');
-    // The introduce endpoint stores peers with trust_level 'introduced' (not 'pending')
-    assert.equal(remotePeer.trust_level, 'introduced');
+    // Default introduce behavior auto-approves fingerprint-valid peers.
+    assert.equal(remotePeer.trust_level, 'trusted');
     assert.equal(remotePeer.operator_name, 'testlocal');
   });
 
@@ -550,6 +748,220 @@ describe('syncPeer — sync-all behavior', () => {
     const peers = cliDb.prepare("SELECT * FROM myr_peers WHERE trust_level = 'trusted' AND auto_sync = 1").all();
     assert.equal(peers.length, 1);
     assert.equal(peers[0].operator_name, 'peer1');
+  });
+});
+
+describe('routePeersForSync', () => {
+  let db;
+
+  before(() => {
+    db = createTestDb();
+
+    const addPeer = db.prepare(`
+      INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, auto_sync, last_sync_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+    addPeer.run('https://alpha.test', 'alpha', '11'.repeat(32), 'trusted', '2026-03-01T00:00:00Z', 1, '2026-04-14T00:00:00Z');
+    addPeer.run('https://beta.test', 'beta', '22'.repeat(32), 'trusted', '2026-03-01T00:00:00Z', 1, '2026-04-15T00:00:00Z');
+    addPeer.run('https://gamma.test', 'gamma', '33'.repeat(32), 'trusted', '2026-03-01T00:00:00Z', 1, '2026-04-13T00:00:00Z');
+    addPeer.run('https://delta.test', 'delta', '44'.repeat(32), 'trusted', '2026-03-01T00:00:00Z', 1, '2026-04-12T00:00:00Z');
+
+    const addReport = db.prepare(`
+      INSERT INTO myr_reports (
+        id, timestamp, agent_id, node_id, cycle_intent, domain_tags, yield_type,
+        question_answered, evidence, what_changes_next, confidence, operator_rating,
+        created_at, updated_at, share_network, imported_from
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    // alpha: strongly trusted in security domain
+    for (let i = 0; i < 8; i++) {
+      addReport.run(
+        `alpha-${i}`,
+        `2026-04-0${(i % 5) + 1}T00:00:00Z`,
+        'agent',
+        'node',
+        'security method',
+        '["security"]',
+        'insight',
+        'q',
+        'e',
+        'n',
+        0.8,
+        4,
+        `2026-04-0${(i % 5) + 1}T00:00:00Z`,
+        `2026-04-0${(i % 5) + 1}T00:00:00Z`,
+        1,
+        'alpha'
+      );
+    }
+
+    // beta: high rating + most recent, but weak domain trust for security
+    addReport.run('beta-1', '2026-04-10T00:00:00Z', 'agent', 'node', 'network method', '["networking"]',
+      'insight', 'q', 'e', 'n', 0.8, 5, '2026-04-10T00:00:00Z', '2026-04-10T00:00:00Z', 1, 'beta');
+
+    // gamma: one falsification should boost routing inclusion
+    addReport.run('gamma-1', '2026-04-09T00:00:00Z', 'agent', 'node', 'security test', '["security"]',
+      'falsification', 'q', 'e', 'n', 0.8, 3, '2026-04-09T00:00:00Z', '2026-04-09T00:00:00Z', 1, 'gamma');
+
+    // local reports used for inferred target domains
+    addReport.run('local-1', '2026-04-11T00:00:00Z', 'agent', 'node', 'local security', '["security"]',
+      'insight', 'q', 'e', 'n', 0.8, 4, '2026-04-11T00:00:00Z', '2026-04-11T00:00:00Z', 1, null);
+  });
+
+  after(() => {
+    db.close();
+  });
+
+  it('orders peers by falsification boost, then domain trust, then rating/recency', () => {
+    const peers = db.prepare("SELECT * FROM myr_peers WHERE trust_level = 'trusted' AND auto_sync = 1").all();
+    const route = routePeersForSync({
+      db,
+      peers,
+      participationStage: 'trusted-full',
+      targetDomains: ['security'],
+    });
+
+    assert.equal(route.ranked[0].peer.operator_name, 'gamma');
+    assert.equal(route.ranked[1].peer.operator_name, 'alpha');
+  });
+
+  it('enforces provisional stage limit of 3 peers', () => {
+    const peers = db.prepare("SELECT * FROM myr_peers WHERE trust_level = 'trusted' AND auto_sync = 1").all();
+    const route = routePeersForSync({
+      db,
+      peers,
+      participationStage: 'provisional',
+      targetDomains: ['security'],
+    });
+
+    assert.equal(route.maxSyncPeers, 3);
+    assert.equal(route.selected.length, 3);
+    assert.equal(route.skipped.length, 1);
+  });
+
+  it('infers target domains from recent local shared reports', () => {
+    const domains = inferTargetDomains(db);
+    assert.ok(domains.includes('security'));
+  });
+});
+
+// ---------- syncPeer (relay auto-fallback) ----------
+
+describe('syncPeer — relay auto-fallback via nodeConfig', () => {
+  let peerServer, peerPort, peerDb, peerKeys, cliDb;
+  const ourKeys = generateKeypair();
+
+  before(() => {
+    peerKeys = generateKeypair();
+    peerDb = createTestDb();
+    cliDb = createTestDb();
+
+    peerDb.prepare(`
+      INSERT INTO myr_reports (id, timestamp, agent_id, node_id, cycle_intent, domain_tags,
+        yield_type, question_answered, evidence, what_changes_next, confidence,
+        created_at, updated_at, share_network)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run('relay-r1', '2026-03-01T10:00:00Z', 'agent1', 'peer-node',
+      'test method', 'testing', 'technique', 'does relay work?', 'yes', 'keep going',
+      0.8, '2026-03-01T10:00:00Z', '2026-03-01T10:00:00Z', 1);
+
+    // Register our key as trusted on the peer
+    peerDb.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run('http://localhost:9999', 'us', ourKeys.publicKey, 'trusted', new Date().toISOString());
+
+    const peerApp = createApp({
+      config: { node_id: 'peer-node', operator_name: 'relay-peer', node_url: 'https://relay-peer.test', port: 0 },
+      db: peerDb,
+      publicKeyHex: peerKeys.publicKey,
+      createdAt: '2026-03-01T10:00:00Z',
+      privateKeyHex: peerKeys.privateKey,
+    });
+    peerServer = peerApp.listen(0);
+    peerPort = peerServer.address().port;
+
+    // Register peer with WRONG URL so direct fetch fails — relay will use correct port
+    cliDb.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run('http://localhost:1', 'relay-peer', peerKeys.publicKey, 'trusted', new Date().toISOString());
+  });
+
+  after(() => {
+    peerServer.close();
+    peerDb.close();
+    cliDb.close();
+  });
+
+  it('auto-falls back to relay when direct connection fails', async () => {
+    const http = require('http');
+    const { httpFetch } = require('../lib/sync');
+
+    // Start a minimal relay that proxies to the real peer
+    const relayServer = http.createServer(async (req, res) => {
+      if (req.method === 'POST' && req.url === '/myr/relay') {
+        let body = '';
+        for await (const chunk of req) body += chunk;
+        const relayReq = JSON.parse(body);
+        const inner = JSON.parse(Buffer.from(relayReq.payload_b64, 'base64').toString('utf8'));
+
+        // Forward inner request to actual peer
+        const targetUrl = `http://localhost:${peerPort}${inner.path}`;
+        try {
+          const proxyRes = await httpFetch(targetUrl, {
+            method: inner.method,
+            headers: inner.headers || {},
+            body: inner.body ? JSON.stringify(inner.body) : undefined,
+          });
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ status: proxyRes.status, body: proxyRes.body, headers: proxyRes.headers }));
+        } catch (err) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { code: 'relay_error', message: err.message } }));
+        }
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    await new Promise(r => relayServer.listen(0, r));
+    const relayPort = relayServer.address().port;
+
+    try {
+      const result = await syncPeer({
+        db: cliDb,
+        peerName: 'relay-peer',
+        keys: ourKeys,
+        nodeConfig: {
+          relay: { enabled: true, url: `http://localhost:${relayPort}`, fallback_only: true },
+        },
+      });
+
+      assert.ok(result.imported >= 1, `Expected imported >= 1, got ${result.imported}`);
+      assert.equal(result.relayUsed, true, 'Should report relay was used');
+      assert.ok(result.message.includes('via relay'), 'Message should mention relay');
+    } finally {
+      relayServer.close();
+    }
+  });
+
+  it('succeeds without relay when nodeConfig has no relay configured', async () => {
+    // Re-point the peer to the real server for direct connection
+    cliDb.prepare('UPDATE myr_peers SET peer_url = ? WHERE operator_name = ?')
+      .run(`http://localhost:${peerPort}`, 'relay-peer');
+
+    const result = await syncPeer({
+      db: cliDb,
+      peerName: 'relay-peer',
+      keys: ourKeys,
+      nodeConfig: {},
+    });
+
+    assert.equal(result.relayUsed, false, 'Relay should not be used for direct connection');
+    // already synced relay-r1, so 0 new imports
+    assert.equal(result.imported, 0);
   });
 });
 
@@ -871,5 +1283,84 @@ describe('verifyPeer', () => {
       () => verifyPeer({ db: cliDb, target: 'nobody' }),
       /No peer found/
     );
+  });
+});
+
+describe('publishSubscription', () => {
+  let db;
+  const keys = generateKeypair();
+
+  before(() => {
+    db = createTestDb();
+    db.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run('http://peer-a.test', 'peer-a', 'aa'.repeat(32), 'trusted', new Date().toISOString());
+  });
+
+  after(() => db.close());
+
+  it('stores active local subscription signals', async () => {
+    const result = await publishSubscription({
+      db,
+      keys,
+      operatorName: 'local-op',
+      tags: ['cryptography'],
+      intentDescription: 'need crypto yield',
+      status: 'active',
+      hops: 0,
+    });
+
+    assert.equal(result.subscription.status, 'active');
+    assert.deepEqual(result.subscription.tags, ['cryptography']);
+    assert.equal(result.propagation.attempted, 0);
+  });
+
+  it('updates the same signal to inactive on unsubscribe', async () => {
+    await publishSubscription({
+      db,
+      keys,
+      operatorName: 'local-op',
+      tags: ['cryptography'],
+      status: 'inactive',
+      hops: 0,
+    });
+
+    const row = db.prepare(
+      'SELECT status FROM myr_subscriptions WHERE owner_public_key = ?'
+    ).get(keys.publicKey);
+    assert.equal(row.status, 'inactive');
+  });
+});
+
+describe('auto-sync interval settings', () => {
+  it('parses duration strings with units', () => {
+    assert.equal(parseDurationMs('15m', 123), 15 * 60 * 1000);
+    assert.equal(parseDurationMs('2h', 123), 2 * 60 * 60 * 1000);
+    assert.equal(parseDurationMs('45s', 123), 45 * 1000);
+  });
+
+  it('falls back when duration strings are invalid', () => {
+    assert.equal(parseDurationMs('', 777), 777);
+    assert.equal(parseDurationMs('invalid', 777), 777);
+    assert.equal(parseDurationMs('0m', 777), 777);
+  });
+
+  it('enforces minimum sync interval floor', () => {
+    const settings = getAutoSyncSettings({
+      auto_sync_interval: '5m',
+      min_sync_interval: '15m',
+    });
+    assert.equal(settings.intervalMs, 15 * 60 * 1000);
+    assert.equal(settings.minIntervalMs, 15 * 60 * 1000);
+    assert.equal(settings.intervalLabel, '15m');
+  });
+
+  it('supports disabling auto-sync explicitly', () => {
+    const settings = getAutoSyncSettings({
+      auto_sync: false,
+      auto_sync_interval: '1h',
+    });
+    assert.equal(settings.enabled, false);
+    assert.equal(settings.intervalMs, 60 * 60 * 1000);
   });
 });

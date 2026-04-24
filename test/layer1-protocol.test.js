@@ -67,6 +67,7 @@ function createTestDb() {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       share_network INTEGER DEFAULT 0,
+      imported_from TEXT,
       signed_by TEXT,
       signed_artifact TEXT
     );
@@ -90,6 +91,18 @@ function createTestDb() {
       expires_at TEXT NOT NULL
     );
     CREATE INDEX idx_nonces_expires ON myr_nonces(expires_at);
+
+    CREATE TABLE myr_applications (
+      id TEXT PRIMARY KEY,
+      source_yield_id TEXT NOT NULL,
+      applied_by_node_id TEXT NOT NULL,
+      downstream_use TEXT NOT NULL,
+      outcome TEXT,
+      applied_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      signed_by TEXT NOT NULL,
+      signature TEXT NOT NULL
+    );
   `);
 
   return db;
@@ -564,5 +577,158 @@ describe('Report signature verification on fetch', () => {
     assert.equal(fetchRes.status, 500);
     assert.equal(fetchRes.body.error.code, 'internal_error');
     assert.ok(fetchRes.body.error.message.includes('signature verification'));
+  });
+});
+
+// --- Application Events Tests ---
+
+describe('Application events for downstream compounding', () => {
+  let server, port, db;
+  const localKeys = generateKeypair();
+
+  before(() => {
+    db = createTestDb();
+
+    db.prepare(
+      "INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)"
+    ).run('https://peer.myr.network', 'peer', peerKeys.publicKey, 'trusted', '2026-03-01T10:00:00Z');
+
+    db.prepare(`
+      INSERT INTO myr_reports (id, timestamp, agent_id, node_id, cycle_intent, domain_tags,
+        yield_type, question_answered, evidence, what_changes_next, confidence,
+        created_at, updated_at, share_network, imported_from)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'recv-1', '2026-03-01T10:00:00Z', 'a1', 'peer-node', 'shared method', 'crypto',
+      'technique', 'how to verify?', 'peer evidence', 'apply locally', 0.8,
+      '2026-03-01T10:00:00Z', '2026-03-01T10:00:00Z', 1, 'peer'
+    );
+
+    db.prepare(`
+      INSERT INTO myr_reports (id, timestamp, agent_id, node_id, cycle_intent, domain_tags,
+        yield_type, question_answered, evidence, what_changes_next, confidence,
+        created_at, updated_at, share_network, imported_from)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      'local-1', '2026-03-01T10:00:00Z', 'a2', 'local-node', 'local method', 'crypto',
+      'insight', 'what changed?', 'local evidence', 'iterate', 0.7,
+      '2026-03-01T10:00:00Z', '2026-03-01T10:00:00Z', 1, null
+    );
+
+    const app = createApp({
+      config: TEST_CONFIG,
+      db,
+      publicKeyHex: localKeys.publicKey,
+      privateKeyHex: localKeys.privateKey,
+      createdAt: TEST_CREATED_AT,
+    });
+    server = app.listen(0);
+    port = server.address().port;
+  });
+
+  after(() => {
+    server.close();
+    db.close();
+  });
+
+  it('records signed application events for received yield', async () => {
+    const body = JSON.stringify({
+      sourceId: 'recv-1',
+      downstreamUse: 'Used the received verification checklist in a live incident review',
+      outcome: 'Reduced triage time by 30%',
+    });
+    const signed = signRequest({
+      method: 'POST',
+      path: '/myr/applications',
+      body,
+      privateKey: localKeys.privateKey,
+      publicKey: localKeys.publicKey,
+    });
+
+    const { status, body: resBody } = await request(port, {
+      method: 'POST',
+      path: '/myr/applications',
+      headers: signed.headers,
+      body,
+    });
+
+    assert.equal(status, 201);
+    assert.equal(resBody.application.source_yield_id, 'recv-1');
+    assert.ok(resBody.application.signature, 'Expected event signature');
+    assert.equal(resBody.compounding_metrics.total_received_yield, 1);
+    assert.equal(resBody.compounding_metrics.applied_received_yield, 1);
+    assert.equal(resBody.compounding_metrics.applied_ratio, 1);
+  });
+
+  it('rejects application events for non-received yield', async () => {
+    const body = JSON.stringify({
+      sourceId: 'local-1',
+      downstreamUse: 'This should be rejected',
+    });
+    const signed = signRequest({
+      method: 'POST',
+      path: '/myr/applications',
+      body,
+      privateKey: localKeys.privateKey,
+      publicKey: localKeys.publicKey,
+    });
+
+    const { status, body: resBody } = await request(port, {
+      method: 'POST',
+      path: '/myr/applications',
+      headers: signed.headers,
+      body,
+    });
+
+    assert.equal(status, 400);
+    assert.equal(resBody.error.code, 'invalid_request');
+  });
+
+  it('lists application events by sourceId for local operator', async () => {
+    const signed = signRequest({
+      method: 'GET',
+      path: '/myr/applications',
+      privateKey: localKeys.privateKey,
+      publicKey: localKeys.publicKey,
+    });
+
+    const { status, body } = await request(port, {
+      path: '/myr/applications?sourceId=recv-1',
+      headers: signed.headers,
+    });
+
+    assert.equal(status, 200);
+    assert.equal(body.applications.length, 1);
+    assert.equal(body.compounding_metrics.applied_ratio, 1);
+  });
+
+  it('requires sourceId for peer reads and allows source-origin peer access', async () => {
+    const signedNoFilter = signRequest({
+      method: 'GET',
+      path: '/myr/applications',
+      privateKey: peerKeys.privateKey,
+      publicKey: peerKeys.publicKey,
+    });
+
+    const noFilter = await request(port, {
+      path: '/myr/applications',
+      headers: signedNoFilter.headers,
+    });
+    assert.equal(noFilter.status, 400);
+    assert.equal(noFilter.body.error.code, 'invalid_request');
+
+    const signedFiltered = signRequest({
+      method: 'GET',
+      path: '/myr/applications',
+      privateKey: peerKeys.privateKey,
+      publicKey: peerKeys.publicKey,
+    });
+
+    const filtered = await request(port, {
+      path: '/myr/applications?sourceId=recv-1',
+      headers: signedFiltered.headers,
+    });
+    assert.equal(filtered.status, 200);
+    assert.equal(filtered.body.applications.length, 1);
   });
 });

@@ -30,7 +30,36 @@ export MYR_HOME=$(pwd)
 
 ## Quick Start
 
+### Zero-config setup reachability (normal path)
+
+```bash
+myr setup
+```
+
+Default reachability selection is automatic and requires no tunnel/port strategy choice:
+
+1. Try Tailscale funnel if available.
+2. Fall back to Cloudflare tunnel.
+3. Fall back to bootstrap relay-backed mode.
+
+If relay-backed mode is used, the node config is written with relay fallback enabled and startup degrades cleanly if the relay is temporarily unreachable.
+
 ### Capture yield
+
+```bash
+myr capture
+```
+
+Interactive mode opens guided prompts (`scripts/myr-store.js --interactive`).
+
+For low-burden automatic candidate extraction from a work log:
+
+```bash
+myr capture --from-log ./session.log --session-intent "debug sync timeouts" --tags "sync,networking"
+cat session.log | myr capture --session-intent "debug sync timeouts" --json
+```
+
+Direct store path is still available:
 
 ```bash
 node scripts/myr-store.js \
@@ -46,12 +75,19 @@ Types: `technique` (reusable method), `insight` (orientation shift), `falsificat
 
 Or use `--interactive` for guided prompts, or `--stdin` for piped JSON.
 
-### Search prior yield
+### Recall prior yield before work
+
+```bash
+myr recall --intent "debug peer sync timeouts"
+myr recall --tags "networking,hyperswarm"
+myr recall --intent "optimize search" --tags "fts,performance" --json
+```
+
+Search path remains available:
 
 ```bash
 node scripts/myr-search.js --query "topic"
 node scripts/myr-search.js --tags "domain" --type falsification
-node scripts/myr-search.js --unverified
 ```
 
 ### Verify (operator review)
@@ -61,7 +97,11 @@ node scripts/myr-verify.js --queue
 node scripts/myr-verify.js --id n1-20260226-001 --rating 4 --notes "Solid"
 ```
 
-Rating 1-5. Only verified MYRs (≥3) can be exported to the network.
+Rating 1-5.
+
+- Auto-drafts enter local queue with `auto_draft=1` and `operator_rating=NULL`
+- Operator review sets `operator_rating`
+- Network eligibility threshold is `operator_rating >= 3` (export gate)
 
 ### Weekly digest
 
@@ -70,6 +110,24 @@ node scripts/myr-weekly.js
 ```
 
 ## Cross-Node Operations
+
+### Invite-link onboarding (normal path)
+
+Create an invite URL on an existing node:
+
+```bash
+myr invite create
+```
+
+Share the resulting `myr://invite/...` link with the new node operator.
+
+Join from the receiving node:
+
+```bash
+myr join "myr://invite/<token>"
+```
+
+This path performs peer introduction from a single link, verifies fingerprint consistency, and validates the invite signature before trust is granted.
 
 ### Export signed artifacts
 
@@ -108,6 +166,24 @@ node scripts/myr-export.js --all
 ```
 
 If all five commands succeed, the node is operational.
+
+## Test Truth
+
+Use two explicit gates:
+
+- Default developer truth (fast regression suite):
+
+```bash
+npm test
+```
+
+- Release truth (default suite + onboarding acceptance truth):
+
+```bash
+npm run test:release
+```
+
+`npm test` is the default day-to-day suite. `npm run test:release` is the publish gate and deliberately includes `test/onboarding-truth-test.js`.
 
 ## Integration with Agent Memory Systems
 

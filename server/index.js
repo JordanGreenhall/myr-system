@@ -12,6 +12,23 @@ const { sign: signMessage, verify: verifySignature, fingerprint: computeFingerpr
 const { httpFetch, makeSignedHeaders } = require('../lib/sync');
 const { verifyLivenessProof, verifyNode } = require('../lib/liveness');
 const { writeTrace } = require('../lib/trace');
+const { recall, explainYield } = require('../lib/recall');
+const { scoreReport, rankReports, explainYield: explainYieldDirect } = require('../lib/yield-scoring');
+const { synthesize, validateSynthesisRequest } = require('../lib/synthesis');
+const { detectContradictions, ensureContradictionsSchema, normalizeDomain } = require('../lib/contradictions');
+const { enforceStage, computeStage, getPeerDomainTrust, STAGES } = require('../lib/participation');
+const {
+  DEFAULT_PROPAGATION_HOPS,
+  ensureSubscriptionsSchema,
+  normalizeTags,
+  computeSignalId,
+  createSignedSignal,
+  verifySignalSignature,
+  upsertSubscriptionSignal,
+  listSubscriptions,
+  getActiveSubscriptionsForOwner,
+  reportMatchesSubscriptions,
+} = require('../lib/subscriptions');
 
 function loadPublicKeyHex(keysPath, nodeId) {
   const publicKeyPath = path.join(keysPath, `${nodeId}.public.pem`);
@@ -42,6 +59,64 @@ function safeCount(db, sql) {
   } catch {
     return 0;
   }
+}
+
+function safeGet(db, sql, ...params) {
+  try {
+    return db.prepare(sql).get(...params);
+  } catch {
+    return null;
+  }
+}
+
+function computeHealthStatus(value, thresholds) {
+  if (value <= thresholds.greenMax) return 'green';
+  if (value <= thresholds.yellowMax) return 'yellow';
+  return 'red';
+}
+
+function hashRawBody(rawBody) {
+  return crypto.createHash('sha256').update(rawBody || '').digest('hex');
+}
+
+function verifyOptionalSignedRequest(req) {
+  const timestamp = req.headers['x-myr-timestamp'];
+  const nonce = req.headers['x-myr-nonce'];
+  const signature = req.headers['x-myr-signature'];
+  const publicKey = req.headers['x-myr-public-key'];
+
+  if (!timestamp && !nonce && !signature && !publicKey) {
+    return { mode: 'none' };
+  }
+
+  if (!timestamp || !nonce || !signature || !publicKey) {
+    return {
+      mode: 'invalid',
+      code: 'auth_required',
+      message: 'Incomplete signed introduction headers',
+    };
+  }
+
+  const requestTime = new Date(timestamp).getTime();
+  if (isNaN(requestTime) || Date.now() - requestTime > 5 * 60 * 1000) {
+    return {
+      mode: 'invalid',
+      code: 'auth_required',
+      message: 'Signed introduction timestamp expired or invalid',
+    };
+  }
+
+  const bodyHash = hashRawBody(req.rawBody);
+  const canonical = `${req.method}\n${req.path}\n${timestamp}\n${nonce}\n${bodyHash}`;
+  if (!verifySignature(canonical, signature, publicKey)) {
+    return {
+      mode: 'invalid',
+      code: 'invalid_signature',
+      message: 'Signed introduction verification failed',
+    };
+  }
+
+  return { mode: 'valid', publicKey, timestamp, nonce };
 }
 
 /**
@@ -81,6 +156,40 @@ function loadRegistry(config) {
   }
 }
 
+function ensureGovernanceSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS myr_quarantined_yields (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      yield_id TEXT NOT NULL UNIQUE,
+      quarantined_at TEXT NOT NULL,
+      quarantined_by TEXT NOT NULL,
+      operator_signature TEXT NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','released')),
+      metadata TEXT DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_quarantine_status ON myr_quarantined_yields(status);
+  `);
+}
+
+function ensureApplicationsSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS myr_applications (
+      id TEXT PRIMARY KEY,
+      source_yield_id TEXT NOT NULL,
+      applied_by_node_id TEXT NOT NULL,
+      downstream_use TEXT NOT NULL,
+      outcome TEXT,
+      applied_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      signed_by TEXT NOT NULL,
+      signature TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_applications_source ON myr_applications(source_yield_id);
+    CREATE INDEX IF NOT EXISTS idx_applications_created ON myr_applications(created_at DESC);
+  `);
+}
+
 /**
  * Create the Express app. Accepts explicit publicKeyHex/createdAt for testing,
  * otherwise loads from the filesystem using config.keys_path and config.node_id.
@@ -118,6 +227,10 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
   }
 
   const startedAt = Date.now();
+  ensureGovernanceSchema(db);
+  ensureContradictionsSchema(db);
+  ensureApplicationsSchema(db);
+  ensureSubscriptionsSchema(db);
 
   // --- Discovery endpoint (no auth) ---
   app.get('/.well-known/myr-node', (req, res) => {
@@ -230,6 +343,293 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     }
   });
 
+  // --- Node health aggregate endpoint (no auth) ---
+  app.get('/myr/health/node', (req, res) => {
+    try {
+      const now = Date.now();
+      const uptimeSeconds = Math.floor((now - startedAt) / 1000);
+      const syncCount = safeCount(db,
+        "SELECT COUNT(*) FROM myr_traces WHERE event_type IN ('sync_pull', 'sync_push', 'relay_sync')");
+      const yieldCount = safeCount(db, 'SELECT COUNT(*) FROM myr_reports');
+      const peerCount = safeCount(db, 'SELECT COUNT(*) FROM myr_peers');
+      const trustedPeerCount = safeCount(db,
+        "SELECT COUNT(*) FROM myr_peers WHERE trust_level = 'trusted'");
+
+      const lastSync = safeGet(db,
+        "SELECT MAX(last_sync_at) AS val FROM myr_peers WHERE last_sync_at IS NOT NULL");
+      const queueAgeSeconds = lastSync && lastSync.val
+        ? Math.max(0, Math.floor((now - new Date(lastSync.val).getTime()) / 1000))
+        : null;
+
+      const thresholds = (config.health_thresholds && config.health_thresholds.node) || {
+        greenMax: 300,
+        yellowMax: 1800,
+      };
+
+      res.json({
+        status: queueAgeSeconds === null ? 'yellow' : computeHealthStatus(queueAgeSeconds, thresholds),
+        metrics: {
+          uptime_seconds: uptimeSeconds,
+          sync_count: syncCount,
+          yield_count: yieldCount,
+          peer_count: peerCount,
+          peer_count_trusted: trustedPeerCount,
+          queue_age_seconds: queueAgeSeconds,
+        },
+        thresholds: {
+          queue_age_seconds: thresholds,
+        },
+        computed_at: new Date(now).toISOString(),
+      });
+    } catch (err) {
+      return errorResponse(res, 'internal_error',
+        'Failed to compute node health', err.message);
+    }
+  });
+
+  // --- Network health aggregate endpoint (no auth) ---
+  app.get('/myr/health/network', (req, res) => {
+    try {
+      const now = Date.now();
+      const freshnessSeconds = (config.health_thresholds &&
+        config.health_thresholds.network &&
+        config.health_thresholds.network.syncFreshnessSeconds) || 900;
+
+      const peers = (() => {
+        try {
+          return db.prepare(
+            "SELECT trust_level, last_sync_at FROM myr_peers WHERE trust_level IN ('trusted', 'pending', 'introduced')"
+          ).all();
+        } catch {
+          return [];
+        }
+      })();
+
+      const knownPeers = peers.length;
+      let reachablePeers = 0;
+      let stalePeers = 0;
+      let totalAge = 0;
+      let ageCount = 0;
+
+      for (const peer of peers) {
+        if (!peer.last_sync_at) {
+          stalePeers++;
+          continue;
+        }
+        const age = Math.max(0, Math.floor((now - new Date(peer.last_sync_at).getTime()) / 1000));
+        totalAge += age;
+        ageCount++;
+        if (age <= freshnessSeconds) {
+          reachablePeers++;
+        } else {
+          stalePeers++;
+        }
+      }
+
+      const reachabilityRatio = knownPeers > 0 ? reachablePeers / knownPeers : 0;
+      const avgSyncAgeSeconds = ageCount > 0 ? Math.round(totalAge / ageCount) : null;
+      const status = reachabilityRatio >= 0.8 ? 'green' : (reachabilityRatio >= 0.5 ? 'yellow' : 'red');
+
+      res.json({
+        status,
+        metrics: {
+          known_peers: knownPeers,
+          reachable_peers: reachablePeers,
+          stale_peers: stalePeers,
+          reachability_ratio: Number(reachabilityRatio.toFixed(3)),
+          sync_freshness_seconds: avgSyncAgeSeconds,
+        },
+        thresholds: {
+          min_reachability_ratio_green: 0.8,
+          min_reachability_ratio_yellow: 0.5,
+          freshness_window_seconds: freshnessSeconds,
+        },
+        computed_at: new Date(now).toISOString(),
+      });
+    } catch (err) {
+      return errorResponse(res, 'internal_error',
+        'Failed to compute network health', err.message);
+    }
+  });
+
+  // --- Flow health aggregate endpoint (no auth) ---
+  app.get('/myr/health/flow', (req, res) => {
+    try {
+      const now = Date.now();
+      const oneHourAgo = new Date(now - 60 * 60 * 1000).toISOString();
+
+      const ingestionRow = safeGet(db,
+        'SELECT COUNT(*) AS cnt FROM myr_reports WHERE created_at >= ?',
+        oneHourAgo);
+      const ingestionRatePerHour = ingestionRow ? ingestionRow.cnt : 0;
+
+      const latencyRow = safeGet(db, `
+        SELECT AVG(
+          (julianday(created_at) - julianday(timestamp)) * 86400.0
+        ) AS avg_seconds
+        FROM myr_reports
+        WHERE imported_from IS NOT NULL
+          AND timestamp IS NOT NULL
+          AND created_at IS NOT NULL
+      `);
+      const syncLatencySeconds = latencyRow && latencyRow.avg_seconds !== null
+        ? Math.max(0, Math.round(latencyRow.avg_seconds))
+        : null;
+
+      const flowStats = safeGet(db, `
+        SELECT
+          SUM(CASE WHEN event_type IN ('sync_pull', 'sync_push') AND outcome IN ('success', 'ok') THEN 1 ELSE 0 END) AS ok_count,
+          SUM(CASE WHEN event_type IN ('sync_pull', 'sync_push') AND outcome IN ('rejected', 'failure', 'error') THEN 1 ELSE 0 END) AS fail_count
+        FROM myr_traces
+      `) || { ok_count: 0, fail_count: 0 };
+      const okCount = flowStats.ok_count || 0;
+      const failCount = flowStats.fail_count || 0;
+      const totalFlowEvents = okCount + failCount;
+      const retrievalEffectiveness = totalFlowEvents > 0 ? okCount / totalFlowEvents : 1;
+
+      const status = retrievalEffectiveness >= 0.9
+        ? 'green'
+        : (retrievalEffectiveness >= 0.75 ? 'yellow' : 'red');
+
+      res.json({
+        status,
+        metrics: {
+          ingestion_rate_per_hour: ingestionRatePerHour,
+          sync_latency_seconds: syncLatencySeconds,
+          retrieval_effectiveness: Number(retrievalEffectiveness.toFixed(3)),
+          successful_sync_events: okCount,
+          failed_sync_events: failCount,
+        },
+        thresholds: {
+          retrieval_effectiveness_green: 0.9,
+          retrieval_effectiveness_yellow: 0.75,
+        },
+        computed_at: new Date(now).toISOString(),
+      });
+    } catch (err) {
+      return errorResponse(res, 'internal_error',
+        'Failed to compute flow health', err.message);
+    }
+  });
+
+  // --- Recall endpoint (no auth — local use only) ---
+  // GET /myr/recall?intent=...&tags=...&query=...&limit=10&verified_only=true
+  app.get('/myr/recall', (req, res) => {
+    const intent = req.query.intent || null;
+    const query = req.query.query || null;
+    const tags = req.query.tags ? req.query.tags.split(',').map(t => t.trim()).filter(Boolean) : [];
+    const limit = Math.min(parseInt(req.query.limit, 10) || 10, 100);
+    const verifiedOnly = req.query.verified_only === 'true';
+
+    if (!intent && !query && tags.length === 0) {
+      return res.json({ results: [], falsifications: [], meta: { error: 'Provide intent, query, or tags' } });
+    }
+
+    const explain = req.query.explain === 'true';
+    const minScore = parseFloat(req.query.min_score) || 0;
+    const result = recall(db, { intent, query, tags, limit, verifiedOnly, explain, minScore });
+    res.json(result);
+  });
+
+  // --- Contradiction detector endpoint (no auth — local use only) ---
+  // GET /myr/contradictions?domain=...
+  app.get('/myr/contradictions', (req, res) => {
+    try {
+      const domain = normalizeDomain(req.query.domain || null);
+      const result = detectContradictions(db, { domain });
+      return res.json({
+        domain,
+        scanned_reports: result.scannedReports,
+        detected_count: result.detectedCount,
+        contradictions: result.contradictions,
+      });
+    } catch (err) {
+      return errorResponse(res, 'internal_error',
+        'Failed to detect contradictions', err.message);
+    }
+  });
+
+  // --- Synthesis endpoint (no auth — local use only) ---
+  // POST /myr/synthesis { tags: string|string[], minNodes?: number, store?: boolean }
+  app.post('/myr/synthesis', (req, res) => {
+    const validation = validateSynthesisRequest(req.body);
+    if (!validation.valid) {
+      return errorResponse(res, 'invalid_request', validation.error);
+    }
+
+    const minNodes = req.body && req.body.minNodes !== undefined
+      ? Number(req.body.minNodes)
+      : 2;
+    const store = req.body && req.body.store !== undefined
+      ? Boolean(req.body.store)
+      : true;
+
+    try {
+      const result = synthesize(db, {
+        tags: validation.tags,
+        minNodes,
+        store,
+      });
+
+      return res.json({
+        synthesis_id: result.synthId,
+        source_count: result.sourceCount,
+        cluster_count: result.clusters.length,
+        stored: !!result.synthId,
+        markdown: result.markdown,
+      });
+    } catch (err) {
+      return errorResponse(res, 'internal_error',
+        'Failed to synthesize MYR data', err.message);
+    }
+  });
+
+  // --- Participation stages endpoint (no auth — local use only) ---
+  // GET /myr/participation — list all stage definitions
+  app.get('/myr/participation/stages', (req, res) => {
+    res.json({ stages: STAGES });
+  });
+
+  // GET /myr/participation/evaluate — evaluate current node's stage
+  app.get('/myr/participation/evaluate', (req, res) => {
+    // Evaluate our own participation stage
+    const currentStage = config.participation_stage || 'local-only';
+    const evaluation = computeStage(db, publicKeyHex, currentStage);
+    const domainTrust = getPeerDomainTrust(db, config.node_id);
+
+    res.json({
+      currentStage,
+      evaluation,
+      domainTrust,
+    });
+  });
+
+  // GET /myr/participation/peer/:publicKey — evaluate a specific peer's stage and domain trust
+  app.get('/myr/participation/peer/:publicKey', (req, res) => {
+    const peer = db.prepare(
+      'SELECT * FROM myr_peers WHERE public_key = ? OR public_key LIKE ?'
+    ).get(req.params.publicKey, `${req.params.publicKey}%`);
+
+    if (!peer) {
+      return errorResponse(res, 'peer_not_found', 'Peer not found');
+    }
+
+    const currentStage = peer.participation_stage || 'local-only';
+    const evaluation = computeStage(db, peer.public_key, currentStage);
+    const domainTrust = getPeerDomainTrust(db, peer.node_id || peer.operator_name);
+
+    res.json({
+      peer: {
+        publicKey: peer.public_key,
+        operatorName: peer.operator_name,
+        trustLevel: peer.trust_level,
+      },
+      currentStage,
+      evaluation,
+      domainTrust,
+    });
+  });
+
   // --- Peer introduce endpoint (PUBLIC — no auth required) ---
   // MYR v1.0 protocol: POST /myr/peer/introduce
   // Receives an identity document, creates a pending peer record, returns our identity.
@@ -241,23 +641,86 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       return errorResponse(res, 'invalid_request', 'Missing identity_document in request body');
     }
 
-    const { public_key, operator_name, node_url } = identity_document;
+    const {
+      public_key,
+      operator_name,
+      node_url,
+      fingerprint: claimedFingerprint,
+      protocol_version: protocolVersion = '1.0.0',
+    } = identity_document;
 
     if (!public_key || !operator_name) {
       return errorResponse(res, 'invalid_request',
         'identity_document must include public_key and operator_name');
     }
 
+    const signedIntro = verifyOptionalSignedRequest(req);
+    if (signedIntro.mode === 'invalid') {
+      return errorResponse(res, signedIntro.code, signedIntro.message);
+    }
+
+    let vouch = { status: 'none' };
+    if (signedIntro.mode === 'valid' && signedIntro.publicKey !== public_key) {
+      const voucher = db.prepare(
+        'SELECT public_key, operator_name, trust_level FROM myr_peers WHERE public_key = ?'
+      ).get(signedIntro.publicKey);
+      if (voucher && voucher.trust_level === 'trusted') {
+        vouch = {
+          status: 'accepted',
+          voucher_public_key: voucher.public_key,
+          voucher_operator_name: voucher.operator_name || null,
+          voucher_fingerprint: computeFingerprint(voucher.public_key),
+          voucher_timestamp: signedIntro.timestamp,
+        };
+      } else {
+        vouch = {
+          status: 'ignored',
+          reason: 'voucher_not_trusted',
+          voucher_public_key: signedIntro.publicKey,
+        };
+      }
+    }
+
     const now = new Date().toISOString();
     const existing = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(public_key);
 
+    const computedFingerprint = computeFingerprint(public_key);
+    const fingerprintMatches = !!claimedFingerprint && claimedFingerprint === computedFingerprint;
+    const autoApproveIntroductionsEnabled = config.auto_approve_introductions !== false;
+    const minAutoApproveIntroVersion = config.auto_approve_intro_min_protocol_version || '1.0.0';
+    const autoApproved = autoApproveIntroductionsEnabled
+      && fingerprintMatches
+      && protocolVersion >= minAutoApproveIntroVersion;
+    const trustLevel = autoApproved ? 'trusted' : 'introduced';
+
     if (!existing) {
       try {
+        const notes = vouch.status === 'accepted'
+          ? JSON.stringify({
+            introduced_by: vouch.voucher_public_key,
+            introduced_by_fingerprint: vouch.voucher_fingerprint,
+            introduced_at: vouch.voucher_timestamp,
+          })
+          : null;
         db.prepare(
-          'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
-        ).run(node_url || '', operator_name, public_key, 'introduced', now);
+          'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, approved_at, notes) VALUES (?, ?, ?, ?, ?, ?, ?)'
+        ).run(node_url || '', operator_name, public_key, trustLevel, now, autoApproved ? now : null, notes);
       } catch (err) {
         return errorResponse(res, 'internal_error', 'Failed to store peer', err.message);
+      }
+    } else if (existing.trust_level !== 'trusted') {
+      try {
+        db.prepare(
+          'UPDATE myr_peers SET peer_url = ?, operator_name = ?, trust_level = ?, approved_at = ? WHERE public_key = ?'
+        ).run(
+          node_url || existing.peer_url,
+          operator_name,
+          trustLevel,
+          autoApproved ? now : existing.approved_at,
+          public_key
+        );
+      } catch (err) {
+        return errorResponse(res, 'internal_error', 'Failed to update peer', err.message);
       }
     }
 
@@ -272,20 +735,34 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     } : null;
 
     if (publicKeyHex) {
+      const traceMetadata = {
+        operator_name,
+        node_url: node_url || '',
+        existing: !!existing,
+        fingerprint_matches: fingerprintMatches,
+        auto_approved: autoApproved,
+      };
+      if (vouch.status === 'accepted') {
+        traceMetadata.vouched_by = vouch.voucher_fingerprint;
+        traceMetadata.vouched_by_public_key = vouch.voucher_public_key;
+      }
       writeTrace(db, {
         eventType: 'introduce',
         actorFingerprint: computeFingerprint(public_key),
         targetFingerprint: computeFingerprint(publicKeyHex),
         outcome: 'success',
-        metadata: { operator_name, node_url: node_url || '', existing: !!existing },
+        metadata: traceMetadata,
       });
     }
 
     return res.json({
-      status: 'introduced',
+      status: autoApproved ? 'connected' : 'introduced',
       our_identity: ourIdentity,
-      trust_level: 'introduced',
-      message: 'Introduction received. Mutual approval required before sync is enabled.',
+      trust_level: trustLevel,
+      vouch,
+      message: autoApproved
+        ? 'Introduction received. Fingerprint verified. Connection confirmed.'
+        : 'Introduction received. Mutual approval required before sync is enabled.',
     });
   });
 
@@ -416,13 +893,95 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     maxRequests: config.rate_limit?.requests_per_minute || 60,
   }));
 
+  function requireLocalOperator(req, res) {
+    if (publicKeyHex && req.auth.publicKey !== publicKeyHex) {
+      errorResponse(res, 'forbidden', 'Only the local node operator may perform this action');
+      return false;
+    }
+    return true;
+  }
+
+  function getOperatorTraceMetadata(req) {
+    return {
+      operator_public_key: req.auth.publicKey,
+      operator_signature: req.headers['x-myr-signature'] || null,
+      request_timestamp: req.headers['x-myr-timestamp'] || null,
+      request_nonce: req.headers['x-myr-nonce'] || null,
+    };
+  }
+
+  function isReceivedYield(row) {
+    return !!(row && row.imported_from && String(row.imported_from).trim() !== '');
+  }
+
+  function applicationCanonicalPayload(row) {
+    return {
+      id: row.id,
+      source_yield_id: row.source_yield_id,
+      applied_by_node_id: row.applied_by_node_id,
+      downstream_use: row.downstream_use,
+      ...(row.outcome ? { outcome: row.outcome } : {}),
+      applied_at: row.applied_at,
+      created_at: row.created_at,
+      signed_by: row.signed_by,
+    };
+  }
+
+  function verifyApplicationSignature(row) {
+    const canonical = canonicalize(applicationCanonicalPayload(row));
+    return verifySignature(canonical, row.signature, row.signed_by);
+  }
+
+  function computeCompoundingMetrics(sourceYieldId) {
+    if (sourceYieldId) {
+      const sourceRow = db.prepare(
+        'SELECT id, imported_from FROM myr_reports WHERE id = ?'
+      ).get(sourceYieldId);
+      const totalReceivedYield = isReceivedYield(sourceRow) ? 1 : 0;
+      const appliedReceivedYield = totalReceivedYield
+        ? db.prepare(
+          'SELECT COUNT(DISTINCT source_yield_id) as cnt FROM myr_applications WHERE source_yield_id = ?'
+        ).get(sourceYieldId).cnt
+        : 0;
+      const applicationEvents = db.prepare(
+        'SELECT COUNT(*) as cnt FROM myr_applications WHERE source_yield_id = ?'
+      ).get(sourceYieldId).cnt;
+
+      return {
+        total_received_yield: totalReceivedYield,
+        applied_received_yield: appliedReceivedYield,
+        application_events: applicationEvents,
+        applied_ratio: totalReceivedYield > 0 ? appliedReceivedYield / totalReceivedYield : 0,
+      };
+    }
+
+    const totals = db.prepare(`
+      SELECT COUNT(*) as total_received_yield
+      FROM myr_reports
+      WHERE imported_from IS NOT NULL AND imported_from != ''
+    `).get();
+    const applied = db.prepare(`
+      SELECT COUNT(DISTINCT a.source_yield_id) as applied_received_yield
+      FROM myr_applications a
+      INNER JOIN myr_reports r ON r.id = a.source_yield_id
+      WHERE r.imported_from IS NOT NULL AND r.imported_from != ''
+    `).get();
+    const eventCount = db.prepare('SELECT COUNT(*) as cnt FROM myr_applications').get();
+
+    return {
+      total_received_yield: totals.total_received_yield || 0,
+      applied_received_yield: applied.applied_received_yield || 0,
+      application_events: eventCount.cnt || 0,
+      applied_ratio: (totals.total_received_yield || 0) > 0
+        ? (applied.applied_received_yield || 0) / totals.total_received_yield
+        : 0,
+    };
+  }
+
   // --- Peer approve endpoint (auth required — local operator key only) ---
   app.post('/myr/peer/approve', (req, res) => {
     // Only the local operator (holding the private key) may approve peers
-    if (publicKeyHex && req.auth.publicKey !== publicKeyHex) {
-      return errorResponse(res, 'forbidden',
-        'Only the local node operator may approve peers');
-    }
+    if (!requireLocalOperator(req, res)) return;
 
     const { peer_fingerprint, trust_level = 'trusted' } = req.body || {};
     if (!peer_fingerprint) {
@@ -445,11 +1004,344 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         `No peer found with fingerprint ${peer_fingerprint}`);
     }
 
+    const now = new Date().toISOString();
     db.prepare('UPDATE myr_peers SET trust_level = ?, approved_at = ? WHERE public_key = ?')
-      .run(trust_level, new Date().toISOString(), found.public_key);
+      .run(trust_level, now, found.public_key);
+
+    writeTrace(db, {
+      eventType: 'approve',
+      actorFingerprint: computeFingerprint(req.auth.publicKey),
+      targetFingerprint: computeFingerprint(found.public_key),
+      outcome: 'success',
+      metadata: {
+        ...getOperatorTraceMetadata(req),
+        trust_level,
+      },
+    });
 
     const updated = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(found.public_key);
     return res.json({ status: 'approved', peer: updated });
+  });
+
+  // --- Application events endpoints (auth required) ---
+  // POST /myr/applications — local operator records downstream usage of received yield.
+  app.post('/myr/applications', (req, res) => {
+    if (!requireLocalOperator(req, res)) return;
+
+    if (!privateKeyHex || !publicKeyHex) {
+      return errorResponse(res, 'internal_error',
+        'Node signing keys are not available for application event signing');
+    }
+
+    const {
+      source_id: sourceIdFromSnake,
+      sourceId: sourceIdFromCamel,
+      downstream_use: downstreamUseFromSnake,
+      downstreamUse: downstreamUseFromCamel,
+      outcome = null,
+      applied_at: appliedAtFromSnake,
+      appliedAt: appliedAtFromCamel,
+    } = req.body || {};
+
+    const sourceYieldId = sourceIdFromSnake || sourceIdFromCamel;
+    const downstreamUse = downstreamUseFromSnake || downstreamUseFromCamel;
+    const appliedAt = appliedAtFromSnake || appliedAtFromCamel || new Date().toISOString();
+
+    if (!sourceYieldId || !downstreamUse) {
+      return errorResponse(res, 'invalid_request',
+        'Missing required fields: sourceId and downstreamUse');
+    }
+
+    if (typeof sourceYieldId !== 'string' || !sourceYieldId.trim()) {
+      return errorResponse(res, 'invalid_request', 'sourceId must be a non-empty string');
+    }
+
+    if (typeof downstreamUse !== 'string' || !downstreamUse.trim()) {
+      return errorResponse(res, 'invalid_request', 'downstreamUse must be a non-empty string');
+    }
+
+    if (outcome !== null && typeof outcome !== 'string') {
+      return errorResponse(res, 'invalid_request', 'outcome must be a string when provided');
+    }
+
+    if (isNaN(new Date(appliedAt).getTime())) {
+      return errorResponse(res, 'invalid_request',
+        'Invalid appliedAt parameter: must be ISO8601 timestamp');
+    }
+
+    const sourceReport = db.prepare(
+      'SELECT id, imported_from FROM myr_reports WHERE id = ?'
+    ).get(sourceYieldId);
+    if (!sourceReport) {
+      return errorResponse(res, 'report_not_found',
+        `No report with id ${sourceYieldId}`);
+    }
+    if (!isReceivedYield(sourceReport)) {
+      return errorResponse(res, 'invalid_request',
+        'sourceId must reference received yield (an imported report)');
+    }
+
+    const now = new Date().toISOString();
+    const row = {
+      id: crypto.randomUUID(),
+      source_yield_id: sourceYieldId.trim(),
+      applied_by_node_id: config.node_id || 'unknown-node',
+      downstream_use: downstreamUse.trim(),
+      outcome: outcome ? outcome.trim() : null,
+      applied_at: new Date(appliedAt).toISOString(),
+      created_at: now,
+      signed_by: publicKeyHex,
+    };
+
+    const canonical = canonicalize(applicationCanonicalPayload(row));
+    row.signature = signMessage(canonical, privateKeyHex);
+
+    db.prepare(`
+      INSERT INTO myr_applications (
+        id, source_yield_id, applied_by_node_id, downstream_use, outcome,
+        applied_at, created_at, signed_by, signature
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      row.id,
+      row.source_yield_id,
+      row.applied_by_node_id,
+      row.downstream_use,
+      row.outcome,
+      row.applied_at,
+      row.created_at,
+      row.signed_by,
+      row.signature
+    );
+
+    return res.status(201).json({
+      application: row,
+      compounding_metrics: computeCompoundingMetrics(),
+    });
+  });
+
+  // GET /myr/applications — list application events, optionally filtered by source report.
+  app.get('/myr/applications', (req, res) => {
+    const isLocalOperator = publicKeyHex && req.auth.publicKey === publicKeyHex;
+    if (!isLocalOperator) {
+      if (!requireTrustedPeer(req, res, 'canReceiveYield')) return;
+    }
+
+    const sourceYieldId = req.query.sourceId || req.query.source_id || null;
+    if (sourceYieldId && typeof sourceYieldId !== 'string') {
+      return errorResponse(res, 'invalid_request', 'sourceId must be a string');
+    }
+
+    if (!isLocalOperator && !sourceYieldId) {
+      return errorResponse(res, 'invalid_request',
+        'sourceId is required when fetching applications as a peer');
+    }
+
+    if (!isLocalOperator && sourceYieldId) {
+      const requester = db.prepare(
+        'SELECT operator_name FROM myr_peers WHERE public_key = ?'
+      ).get(req.auth.publicKey);
+      const sourceReport = db.prepare(
+        'SELECT imported_from FROM myr_reports WHERE id = ?'
+      ).get(sourceYieldId);
+
+      if (!sourceReport) {
+        return errorResponse(res, 'report_not_found',
+          `No report with id ${sourceYieldId}`);
+      }
+
+      if (!requester || !sourceReport.imported_from || sourceReport.imported_from !== requester.operator_name) {
+        return errorResponse(res, 'forbidden',
+          'Peers may only fetch application events for yields they originated');
+      }
+    }
+
+    let rows;
+    if (sourceYieldId) {
+      rows = db.prepare(`
+        SELECT *
+        FROM myr_applications
+        WHERE source_yield_id = ?
+        ORDER BY created_at DESC
+      `).all(sourceYieldId);
+    } else {
+      rows = db.prepare(`
+        SELECT *
+        FROM myr_applications
+        ORDER BY created_at DESC
+      `).all();
+    }
+
+    const applications = [];
+    for (const row of rows) {
+      if (verifyApplicationSignature(row)) {
+        applications.push(row);
+      }
+    }
+
+    return res.json({
+      applications,
+      compounding_metrics: computeCompoundingMetrics(sourceYieldId || null),
+    });
+  });
+
+  // --- Governance audit endpoint (auth required — local operator key only) ---
+  app.get('/myr/governance/audit', (req, res) => {
+    if (!requireLocalOperator(req, res)) return;
+
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 200, 2000));
+    const traces = db.prepare(`
+      SELECT *
+      FROM myr_traces
+      WHERE event_type IN ('approve', 'stage_change', 'revoke', 'sync_pull', 'sync_push', 'relay_sync', 'quarantine')
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `).all(limit);
+
+    const approvals = traces.filter((row) => row.event_type === 'approve');
+    const revocations = traces.filter((row) => row.event_type === 'revoke');
+    const syncEvents = traces.filter((row) => ['sync_pull', 'sync_push', 'relay_sync'].includes(row.event_type));
+    const stageChanges = traces.filter((row) => row.event_type === 'stage_change');
+    const quarantines = traces.filter((row) => row.event_type === 'quarantine');
+
+    let peerStageChanges = [];
+    try {
+      peerStageChanges = db.prepare(`
+        SELECT operator_name, public_key, participation_stage, stage_changed_at, stage_evidence
+        FROM myr_peers
+        WHERE stage_changed_at IS NOT NULL
+        ORDER BY stage_changed_at DESC
+        LIMIT ?
+      `).all(limit).map((row) => ({
+        event_type: 'stage_change',
+        timestamp: row.stage_changed_at,
+        actor_fingerprint: computeFingerprint(req.auth.publicKey),
+        target_fingerprint: computeFingerprint(row.public_key),
+        outcome: 'success',
+        metadata: JSON.stringify({
+          source: 'peer_stage_column',
+          operator_name: row.operator_name || null,
+          participation_stage: row.participation_stage || null,
+          stage_evidence: row.stage_evidence || null,
+        }),
+      }));
+    } catch (_) {
+      peerStageChanges = [];
+    }
+
+    const quarantinedYields = db.prepare(`
+      SELECT yield_id, quarantined_at, quarantined_by, operator_signature, reason, status, metadata
+      FROM myr_quarantined_yields
+      ORDER BY quarantined_at DESC
+      LIMIT ?
+    `).all(limit);
+
+    return res.json({
+      limit,
+      audit: {
+        approvals,
+        stage_changes: [...stageChanges, ...peerStageChanges]
+          .sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || ''))),
+        revocations,
+        sync_events: syncEvents,
+        quarantines,
+        quarantined_yields: quarantinedYields,
+      },
+    });
+  });
+
+  // --- Governance revoke endpoint (auth required — local operator key only) ---
+  app.post('/myr/governance/revoke', (req, res) => {
+    if (!requireLocalOperator(req, res)) return;
+
+    const { peer_fingerprint } = req.body || {};
+    if (!peer_fingerprint) {
+      return errorResponse(res, 'invalid_request', 'Missing peer_fingerprint');
+    }
+
+    const rows = db.prepare('SELECT * FROM myr_peers').all();
+    let found = null;
+    for (const row of rows) {
+      if (computeFingerprint(row.public_key) === peer_fingerprint || row.public_key.startsWith(peer_fingerprint)) {
+        found = row;
+        break;
+      }
+    }
+    if (!found) {
+      return errorResponse(res, 'peer_not_found', `No peer found with fingerprint ${peer_fingerprint}`);
+    }
+
+    const now = new Date().toISOString();
+    db.prepare('UPDATE myr_peers SET trust_level = ? WHERE public_key = ?')
+      .run('revoked', found.public_key);
+
+    writeTrace(db, {
+      eventType: 'revoke',
+      actorFingerprint: computeFingerprint(req.auth.publicKey),
+      targetFingerprint: computeFingerprint(found.public_key),
+      outcome: 'success',
+      metadata: {
+        ...getOperatorTraceMetadata(req),
+        revoked_at: now,
+        previous_trust_level: found.trust_level,
+      },
+    });
+
+    const updated = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(found.public_key);
+    return res.json({ status: 'revoked', peer: updated });
+  });
+
+  // --- Governance quarantine endpoint (auth required — local operator key only) ---
+  app.post('/myr/governance/quarantine', (req, res) => {
+    if (!requireLocalOperator(req, res)) return;
+
+    const { yield_id, reason = null } = req.body || {};
+    if (!yield_id) {
+      return errorResponse(res, 'invalid_request', 'Missing yield_id');
+    }
+
+    const report = db.prepare('SELECT id FROM myr_reports WHERE id = ?').get(yield_id);
+    if (!report) {
+      return errorResponse(res, 'report_not_found', `No report with id ${yield_id}`);
+    }
+
+    const now = new Date().toISOString();
+    const actorFingerprint = computeFingerprint(req.auth.publicKey);
+    const operatorSignature = req.headers['x-myr-signature'] || '';
+    db.prepare(`
+      INSERT INTO myr_quarantined_yields (
+        yield_id, quarantined_at, quarantined_by, operator_signature, reason, status, metadata
+      ) VALUES (?, ?, ?, ?, ?, 'active', ?)
+      ON CONFLICT(yield_id) DO UPDATE SET
+        quarantined_at = excluded.quarantined_at,
+        quarantined_by = excluded.quarantined_by,
+        operator_signature = excluded.operator_signature,
+        reason = excluded.reason,
+        status = 'active',
+        metadata = excluded.metadata
+    `).run(
+      yield_id,
+      now,
+      actorFingerprint,
+      operatorSignature,
+      reason,
+      JSON.stringify({
+        source: 'governance_quarantine_endpoint',
+      })
+    );
+
+    writeTrace(db, {
+      eventType: 'quarantine',
+      actorFingerprint,
+      outcome: 'success',
+      metadata: {
+        ...getOperatorTraceMetadata(req),
+        yield_id,
+        reason,
+      },
+    });
+
+    const row = db.prepare('SELECT * FROM myr_quarantined_yields WHERE yield_id = ?').get(yield_id);
+    return res.json({ status: 'quarantined', quarantine: row });
   });
 
   // --- Peer list endpoint (auth required) ---
@@ -543,11 +1435,199 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     }
   });
 
-  // --- Reports listing endpoint (auth required, trusted peers only) ---
-  app.get('/myr/reports', (req, res) => {
-    if (!requireTrustedPeer(req, res)) return;
+  async function propagateSubscriptionSignal({ signal, hopsRemaining, excludePublicKeys = [] }) {
+    const hops = Math.max(0, parseInt(hopsRemaining, 10) || 0);
+    if (hops <= 0 || !privateKeyHex || !publicKeyHex) {
+      return { attempted: 0, delivered: 0, failed: 0 };
+    }
 
-    const since = req.query.since || null;
+    const excluded = new Set((excludePublicKeys || []).filter(Boolean));
+    const peers = db.prepare(`
+      SELECT public_key, operator_name, peer_url
+      FROM myr_peers
+      WHERE trust_level = 'trusted'
+        AND peer_url IS NOT NULL
+        AND peer_url != ''
+    `).all().filter((peer) => !excluded.has(peer.public_key));
+
+    let delivered = 0;
+    let failed = 0;
+    for (const peer of peers) {
+      const body = {
+        ...signal,
+        hops_remaining: hops,
+        propagated_by: computeFingerprint(publicKeyHex),
+      };
+
+      const headers = makeSignedHeaders({
+        method: 'POST',
+        urlPath: '/myr/subscriptions',
+        body,
+        privateKey: privateKeyHex,
+        publicKey: publicKeyHex,
+      });
+
+      try {
+        const response = await httpFetch(peer.peer_url.replace(/\/+$/, '') + '/myr/subscriptions', {
+          method: 'POST',
+          headers: {
+            ...headers,
+            'content-type': 'application/json',
+          },
+          body,
+        });
+        if (response.status >= 200 && response.status < 300) {
+          delivered++;
+        } else {
+          failed++;
+        }
+      } catch {
+        failed++;
+      }
+    }
+
+    return { attempted: peers.length, delivered, failed };
+  }
+
+  // --- Demand signal subscription endpoints (auth required) ---
+  app.post('/myr/subscriptions', async (req, res) => {
+    const body = req.body || {};
+    const isLocalOperator = publicKeyHex && req.auth.publicKey === publicKeyHex;
+
+    if (!isLocalOperator && !requireTrustedPeer(req, res, 'canSync')) return;
+
+    try {
+      if (isLocalOperator) {
+        if (!privateKeyHex || !publicKeyHex) {
+          return errorResponse(res, 'internal_error',
+            'Node signing keys are not available for subscription signing');
+        }
+
+        const tags = normalizeTags(body.tags);
+        if (tags.length === 0) {
+          return errorResponse(res, 'invalid_request', 'tags must contain at least one domain tag');
+        }
+
+        const status = body.action === 'unsubscribe' || body.status === 'inactive'
+          ? 'inactive'
+          : 'active';
+        const parsedHops = Number.isFinite(Number(body.hops))
+          ? Number(body.hops)
+          : (Number.isFinite(Number(config.subscription_propagation_hops))
+            ? Number(config.subscription_propagation_hops)
+            : DEFAULT_PROPAGATION_HOPS);
+        const hops = Math.max(0, Math.min(parsedHops, 5));
+        const signalId = body.signal_id || computeSignalId(publicKeyHex, tags);
+        const existing = db.prepare(
+          'SELECT created_at FROM myr_subscriptions WHERE signal_id = ?'
+        ).get(signalId);
+
+        const signal = createSignedSignal({
+          ownerPublicKey: publicKeyHex,
+          ownerOperatorName: operatorName,
+          tags,
+          intentDescription: body.intent_description || body.intent || null,
+          status,
+          privateKey: privateKeyHex,
+          createdAt: existing ? existing.created_at : undefined,
+          signalId,
+        });
+
+        const stored = upsertSubscriptionSignal(db, signal, {
+          source: 'local',
+          receivedFrom: publicKeyHex,
+          hopsRemaining: hops,
+        });
+        const propagation = await propagateSubscriptionSignal({
+          signal,
+          hopsRemaining: hops,
+          excludePublicKeys: [publicKeyHex],
+        });
+
+        return res.status(201).json({
+          status: 'ok',
+          subscription: stored,
+          propagation,
+        });
+      }
+
+      const tags = normalizeTags(body.tags);
+      if (tags.length === 0) {
+        return errorResponse(res, 'invalid_request', 'tags must contain at least one domain tag');
+      }
+      const signal = {
+        signal_id: body.signal_id,
+        owner_public_key: body.owner_public_key,
+        owner_fingerprint: body.owner_fingerprint,
+        owner_operator_name: body.owner_operator_name || null,
+        tags,
+        intent_description: body.intent_description || null,
+        status: body.status === 'inactive' ? 'inactive' : 'active',
+        created_at: body.created_at,
+        updated_at: body.updated_at,
+        signal_signature: body.signal_signature,
+      };
+
+      if (!signal.signal_id || !signal.owner_public_key || !signal.created_at || !signal.updated_at) {
+        return errorResponse(res, 'invalid_request',
+          'Missing required fields: signal_id, owner_public_key, created_at, updated_at');
+      }
+
+      if (!verifySignalSignature(signal)) {
+        return errorResponse(res, 'invalid_signature', 'Subscription signal signature verification failed');
+      }
+
+      const hopsRemaining = Math.max(0, Math.min(parseInt(body.hops_remaining, 10) || 0, 5));
+      const stored = upsertSubscriptionSignal(db, signal, {
+        source: 'remote',
+        receivedFrom: req.auth.publicKey,
+        hopsRemaining,
+      });
+
+      const propagation = await propagateSubscriptionSignal({
+        signal,
+        hopsRemaining: hopsRemaining - 1,
+        excludePublicKeys: [req.auth.publicKey],
+      });
+
+      return res.json({
+        status: 'accepted',
+        subscription: stored,
+        propagation,
+      });
+    } catch (err) {
+      return errorResponse(res, 'internal_error',
+        'Failed to process subscription signal', err.message);
+    }
+  });
+
+  app.get('/myr/subscriptions', (req, res) => {
+    const isLocalOperator = publicKeyHex && req.auth.publicKey === publicKeyHex;
+    if (!isLocalOperator && !requireTrustedPeer(req, res, 'canSync')) return;
+
+    const includeInactive = req.query.include_inactive === 'true';
+    const owner = isLocalOperator && req.query.owner_public_key
+      ? req.query.owner_public_key
+      : req.auth.publicKey;
+
+    const subscriptions = listSubscriptions(db, {
+      ownerPublicKey: owner,
+      includeInactive,
+    });
+
+    return res.json({
+      subscriptions,
+      owner_public_key: owner,
+      include_inactive: includeInactive,
+    });
+  });
+
+  // --- Reports listing endpoint (auth required, trusted peers with canReceiveYield) ---
+  app.get('/myr/reports', (req, res) => {
+    if (!requireTrustedPeer(req, res, 'canReceiveYield')) return;
+
+    const from = req.query.from || req.query.since || null;
+    const until = req.query.until || null;
     let limit = 100;
 
     if (req.query.limit !== undefined) {
@@ -559,29 +1639,52 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       limit = Math.min(limit, 500);
     }
 
-    if (since && isNaN(new Date(since).getTime())) {
+    if (from && isNaN(new Date(from).getTime())) {
       return errorResponse(res, 'invalid_request',
-        'Invalid since parameter: must be ISO8601 timestamp');
+        'Invalid from/since parameter: must be ISO8601 timestamp');
+    }
+    if (until && isNaN(new Date(until).getTime())) {
+      return errorResponse(res, 'invalid_request',
+        'Invalid until parameter: must be ISO8601 timestamp');
+    }
+    if (from && until && new Date(until).getTime() <= new Date(from).getTime()) {
+      return errorResponse(res, 'invalid_request',
+        'Invalid range: until must be greater than from/since');
     }
 
-    let rows, total;
-    if (since) {
-      rows = db.prepare(
-        'SELECT * FROM myr_reports WHERE share_network = 1 AND created_at > ? ORDER BY created_at ASC LIMIT ?'
-      ).all(since, limit);
-      total = db.prepare(
-        'SELECT COUNT(*) as cnt FROM myr_reports WHERE share_network = 1 AND created_at > ?'
-      ).get(since).cnt;
+    let candidateRows;
+    if (from && until) {
+      candidateRows = db.prepare(`
+        SELECT *
+        FROM myr_reports
+        WHERE share_network = 1 AND created_at > ? AND created_at <= ?
+        ORDER BY created_at ASC
+      `).all(from, until);
+    } else if (from) {
+      candidateRows = db.prepare(
+        'SELECT * FROM myr_reports WHERE share_network = 1 AND created_at > ? ORDER BY created_at ASC'
+      ).all(from);
     } else {
-      rows = db.prepare(
-        'SELECT * FROM myr_reports WHERE share_network = 1 ORDER BY created_at ASC LIMIT ?'
-      ).all(limit);
-      total = db.prepare(
-        'SELECT COUNT(*) as cnt FROM myr_reports WHERE share_network = 1'
-      ).get().cnt;
+      candidateRows = db.prepare(
+        'SELECT * FROM myr_reports WHERE share_network = 1 ORDER BY created_at ASC'
+      ).all();
     }
 
-    const reports = rows.map((row) => {
+    const peerSubscriptions = getActiveSubscriptionsForOwner(db, req.auth.publicKey);
+    const filteredRows = peerSubscriptions.length > 0
+      ? candidateRows.filter((row) => reportMatchesSubscriptions(row.domain_tags, peerSubscriptions))
+      : candidateRows;
+
+    // Trust-weighted ranking: score and sort by composite yield score
+    const scored = filteredRows.map((row) => {
+      const { score } = scoreReport(db, row);
+      return { row, score };
+    }).sort((a, b) => b.score - a.score);
+
+    const total = scored.length;
+    const topScored = scored.slice(0, limit);
+
+    const reports = topScored.map(({ row, score }) => {
       const reportObj = { ...row };
       delete reportObj.signature;
       delete reportObj.operator_signature;
@@ -595,19 +1698,25 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         created_at: row.created_at,
         method_name: row.cycle_intent,
         operator_rating: row.operator_rating,
+        yield_score: score,
         size_bytes: Buffer.byteLength(canonical, 'utf8'),
         url: '/myr/reports/' + sig,
       };
     });
 
     // sync_cursor: the created_at of the last returned report (use as 'since' for next call)
-    const syncCursor = rows.length > 0 ? rows[rows.length - 1].created_at : (since || null);
+    const rows = topScored.map(s => s.row);
+    const syncCursor = rows.length > 0 ? rows[rows.length - 1].created_at : (from || null);
 
     res.json({
       reports,
       total,
-      since,
+      since: from,
+      from,
+      until,
       sync_cursor: syncCursor,
+      filtered_by_subscriptions: peerSubscriptions.length > 0,
+      trust_weighted: true,
     });
   });
 
@@ -953,12 +2062,20 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     });
   });
 
-  // --- Helper: check peer is trusted ---
-  function requireTrustedPeer(req, res) {
+  // --- Helper: check peer is trusted (stage-aware) ---
+  function requireTrustedPeer(req, res, requiredCapability) {
     const publicKey = req.auth.publicKey;
-    const peer = db.prepare(
-      'SELECT trust_level FROM myr_peers WHERE public_key = ?'
-    ).get(publicKey);
+    let peer;
+    try {
+      peer = db.prepare(
+        'SELECT trust_level, participation_stage FROM myr_peers WHERE public_key = ?'
+      ).get(publicKey);
+    } catch (_) {
+      // Fallback for DBs without participation_stage column
+      peer = db.prepare(
+        'SELECT trust_level FROM myr_peers WHERE public_key = ?'
+      ).get(publicKey);
+    }
 
     if (!peer) {
       errorResponse(res, 'unknown_peer', 'Your public key is not in our peer list');
@@ -973,12 +2090,23 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         "Peer relationship exists but trust_level != 'trusted'");
       return null;
     }
+
+    // Stage-based enforcement when a capability is specified
+    if (requiredCapability) {
+      const stageCheck = enforceStage(db, publicKey, requiredCapability);
+      if (stageCheck && !stageCheck.allowed) {
+        errorResponse(res, 'stage_insufficient',
+          `Participation stage '${stageCheck.stage}' lacks capability '${requiredCapability}'`);
+        return null;
+      }
+    }
+
     return peer;
   }
 
-  // --- Report fetch endpoint (auth required, trusted peers only) ---
+  // --- Report fetch endpoint (auth required, trusted peers with canReceiveYield) ---
   app.get('/myr/reports/:signature', (req, res) => {
-    if (!requireTrustedPeer(req, res)) return;
+    if (!requireTrustedPeer(req, res, 'canReceiveYield')) return;
 
     const requestedSig = req.params.signature;
     const rows = db.prepare('SELECT * FROM myr_reports').all();
@@ -1040,10 +2168,22 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     res.send(responseBody);
   });
 
-  // --- Sync pull endpoint (auth required, trusted peers only) ---
+  // --- Yield explainability endpoint ---
+  // GET /myr/reports/:reportId/explain — explain why a specific report would be surfaced or withheld
+  app.get('/myr/reports/:reportId/explain', (req, res) => {
+    const reportId = req.params.reportId;
+    const report = db.prepare('SELECT * FROM myr_reports WHERE id = ?').get(reportId);
+    if (!report) {
+      return errorResponse(res, 'report_not_found', `No report with id ${reportId}`);
+    }
+    const explanation = explainYieldDirect(db, report);
+    res.json(explanation);
+  });
+
+  // --- Sync pull endpoint (auth required, trusted peers with canSync) ---
   // POST /myr/sync/pull — Trigger async pull from requesting peer
   app.post('/myr/sync/pull', (req, res) => {
-    if (!requireTrustedPeer(req, res)) return;
+    if (!requireTrustedPeer(req, res, 'canSync')) return;
 
     const { since } = req.body || {};
     if (since && isNaN(new Date(since).getTime())) {

@@ -9,6 +9,7 @@
 
 const http = require('http');
 const { getDb, generateId } = require('./db');
+const config = require('./config');
 
 function parseArgs() {
   const args = process.argv.slice(2);
@@ -70,7 +71,7 @@ const VALID_TYPES = ['technique', 'insight', 'falsification', 'pattern'];
 const PLACEHOLDER = '[AUTO-DRAFT]';
 
 async function main() {
-  validateConfig();
+  config.validateConfig();
   const opts = parseArgs();
 
   const prompt = `You are extracting structured methodological yield from a memory record.
@@ -139,7 +140,7 @@ Return ONLY the JSON object.`;
       ?, ?
     )
   `).run(
-    id, now, opts.agent || 'unknown', require('./config').node_id,
+    id, now, opts.agent || 'unknown', config.node_id,
     intent, JSON.stringify(allTags),
     yieldType, questionAnswered, evidence, whatChangesNext,
     whatWasFalsified, confidence,

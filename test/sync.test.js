@@ -126,13 +126,24 @@ function createMockFetch(reports, options = {}) {
 
       const urlObj = new URL(url, 'http://localhost');
       const since = urlObj.searchParams.get('since');
+      const from = urlObj.searchParams.get('from');
+      const until = urlObj.searchParams.get('until');
+      const limitRaw = parseInt(urlObj.searchParams.get('limit') || '500', 10);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? limitRaw : 500;
 
       let filtered = reports;
       if (since) {
         filtered = reports.filter((r) => r.created_at > since);
       }
+      if (from) {
+        filtered = reports.filter((r) => r.created_at > from);
+      }
+      if (until) {
+        filtered = filtered.filter((r) => r.created_at <= until);
+      }
+      const paged = filtered.slice(0, limit);
 
-      const listing = filtered.map((r) => ({
+      const listing = paged.map((r) => ({
         signature: r.signature,
         operator_name: 'testpeer',
         created_at: r.created_at,
@@ -142,7 +153,8 @@ function createMockFetch(reports, options = {}) {
         url: '/myr/reports/' + r.signature,
       }));
 
-      const body = { reports: listing, total: listing.length, since };
+      const syncCursor = listing.length > 0 ? listing[listing.length - 1].created_at : (from || since || null);
+      const body = { reports: listing, total: filtered.length, since: from || since, from, until, sync_cursor: syncCursor };
       return { status: 200, body, rawBody: JSON.stringify(body), headers: {} };
     }
 
@@ -422,6 +434,86 @@ describe('syncPeer (lib/sync)', () => {
       () => syncPeer({ db, peer, keys: ourKeys, fetch: mockFetch }),
       /Network error/
     );
+
+    db.close();
+  });
+
+  it('recovers all missed reports after long offline period via paged replay', async () => {
+    const db = createTestDb();
+    const reports = [];
+    const baseMs = Date.parse('2026-03-01T00:00:00Z');
+    for (let i = 0; i < 1200; i++) {
+      const createdAt = new Date(baseMs + (i + 1) * 60 * 1000).toISOString();
+      reports.push(createSignedReport({ id: `bulk-${i}`, created_at: createdAt, updated_at: createdAt }, peerKeys.privateKey));
+    }
+    const mockFetch = createMockFetch(reports);
+
+    const lastSyncAt = '2026-03-01T00:00:00Z';
+    const peer = {
+      peer_url: 'http://localhost:9999',
+      operator_name: 'testpeer',
+      public_key: peerKeys.publicKey,
+      last_sync_at: lastSyncAt,
+    };
+    db.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, last_sync_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(peer.peer_url, peer.operator_name, peer.public_key, 'trusted', '2026-03-01T00:00:00Z', lastSyncAt);
+
+    const result = await syncPeer({ db, peer, keys: ourKeys, fetch: mockFetch });
+
+    assert.equal(result.failed, 0);
+    assert.equal(result.imported, 1200);
+    assert.ok(result.recoveredRanges > 0, 'expected pagination recovery to be used');
+
+    const count = db.prepare('SELECT COUNT(*) as cnt FROM myr_reports').get().cnt;
+    assert.equal(count, 1200);
+
+    db.close();
+  });
+
+  it('supports explicit replay range and keeps dedup guarantees', async () => {
+    const db = createTestDb();
+    const r1 = createSignedReport({ id: 'range-1', created_at: '2026-03-01T10:00:00Z' }, peerKeys.privateKey);
+    const r2 = createSignedReport({ id: 'range-2', created_at: '2026-03-01T11:00:00Z' }, peerKeys.privateKey);
+    const r3 = createSignedReport({ id: 'range-3', created_at: '2026-03-01T12:00:00Z' }, peerKeys.privateKey);
+    const mockFetch = createMockFetch([r1, r2, r3]);
+
+    const peer = {
+      peer_url: 'http://localhost:9999',
+      operator_name: 'testpeer',
+      public_key: peerKeys.publicKey,
+      last_sync_at: null,
+    };
+    db.prepare(
+      'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at) VALUES (?, ?, ?, ?, ?)'
+    ).run(peer.peer_url, peer.operator_name, peer.public_key, 'trusted', '2026-03-01T00:00:00Z');
+
+    db.prepare(`
+      INSERT INTO myr_reports (id, timestamp, agent_id, node_id, cycle_intent, domain_tags,
+        yield_type, question_answered, evidence, what_changes_next, confidence,
+        created_at, updated_at, share_network, imported_from, import_verified, signed_artifact)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      r2.id, r2.timestamp, r2.agent_id, r2.node_id, r2.cycle_intent, r2.domain_tags,
+      r2.yield_type, r2.question_answered, r2.evidence, r2.what_changes_next, r2.confidence,
+      r2.created_at, r2.updated_at, 0, 'testpeer', 1, r2.signature
+    );
+
+    const result = await syncPeer({
+      db,
+      peer,
+      keys: ourKeys,
+      fetch: mockFetch,
+      replay: { from: '2026-03-01T09:30:00Z', until: '2026-03-01T12:00:00Z' },
+    });
+
+    assert.equal(result.failed, 0);
+    assert.equal(result.imported, 2);
+    assert.ok(result.skipped >= 1);
+    assert.ok(result.replayedRanges >= 0);
+
+    const importedRows = db.prepare('SELECT id FROM myr_reports ORDER BY id').all().map((r) => r.id);
+    assert.deepEqual(importedRows, ['range-1', 'range-2', 'range-3']);
 
     db.close();
   });

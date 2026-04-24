@@ -22,6 +22,11 @@ function getDb() {
   migrateTracesTable(db);
   migrateTracesEventTypes(db);
   migrateFingerprintVerification(db);
+  migrateParticipationStages(db);
+  migrateGovernanceTables(db);
+  migrateContradictionsTable(db);
+  migrateApplicationsTable(db);
+  migrateSubscriptionsTable(db);
 
   return db;
 }
@@ -200,7 +205,7 @@ function migrateTracesTable(db) {
     CREATE TABLE IF NOT EXISTS myr_traces (
       trace_id TEXT PRIMARY KEY,
       timestamp TEXT NOT NULL,
-      event_type TEXT NOT NULL CHECK(event_type IN ('introduce','approve','share','sync_pull','sync_push','verify','reject','discover','relay_sync')),
+      event_type TEXT NOT NULL CHECK(event_type IN ('introduce','approve','share','sync_pull','sync_push','verify','reject','discover','relay_sync','revoke','quarantine','stage_change')),
       actor_fingerprint TEXT NOT NULL,
       target_fingerprint TEXT,
       artifact_signature TEXT,
@@ -224,13 +229,20 @@ function migrateTracesEventTypes(db) {
   ).get();
 
   // If table doesn't exist yet (will be created by migrateTracesTable) or already upgraded
-  if (!tableInfo || (tableInfo.sql && tableInfo.sql.includes("'discover'"))) return;
+  if (
+    !tableInfo ||
+    (tableInfo.sql &&
+      tableInfo.sql.includes("'discover'") &&
+      tableInfo.sql.includes("'revoke'") &&
+      tableInfo.sql.includes("'quarantine'") &&
+      tableInfo.sql.includes("'stage_change'"))
+  ) return;
 
   // Recreate with updated constraint
   db.exec(`CREATE TABLE myr_traces_v11 (
     trace_id TEXT PRIMARY KEY,
     timestamp TEXT NOT NULL,
-    event_type TEXT NOT NULL CHECK(event_type IN ('introduce','approve','share','sync_pull','sync_push','verify','reject','discover','relay_sync')),
+    event_type TEXT NOT NULL CHECK(event_type IN ('introduce','approve','share','sync_pull','sync_push','verify','reject','discover','relay_sync','revoke','quarantine','stage_change')),
     actor_fingerprint TEXT NOT NULL,
     target_fingerprint TEXT,
     artifact_signature TEXT,
@@ -258,6 +270,103 @@ function migrateFingerprintVerification(db) {
   addColumn('myr_peers', 'node_uuid', 'TEXT');
   addColumn('myr_peers', 'verification_evidence', 'TEXT');
   addColumn('myr_peers', 'auto_approved', 'INTEGER DEFAULT 0');
+}
+
+function migrateParticipationStages(db) {
+  const addColumn = (table, col, typedef) => {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${typedef}`);
+    } catch (_) {
+      // column already exists
+    }
+  };
+
+  // Participation stage: local-only, provisional, bounded, trusted-full
+  addColumn('myr_peers', 'participation_stage', "TEXT DEFAULT 'local-only'");
+  // Domain trust scores as JSON: { "networking": 0.7, "crypto": 0.3 }
+  addColumn('myr_peers', 'domain_trust', "TEXT DEFAULT '{}'");
+  // When the stage was last evaluated
+  addColumn('myr_peers', 'stage_evaluated_at', 'TEXT');
+  // When the stage last changed
+  addColumn('myr_peers', 'stage_changed_at', 'TEXT');
+  // Evidence for the current stage (JSON: promotion/demotion reason + stats)
+  addColumn('myr_peers', 'stage_evidence', 'TEXT');
+}
+
+function migrateGovernanceTables(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS myr_quarantined_yields (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      yield_id TEXT NOT NULL UNIQUE,
+      quarantined_at TEXT NOT NULL,
+      quarantined_by TEXT NOT NULL,
+      operator_signature TEXT NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','released')),
+      metadata TEXT DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_quarantine_status ON myr_quarantined_yields(status);
+  `);
+}
+
+function migrateContradictionsTable(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS myr_contradictions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      yield_a_id TEXT NOT NULL,
+      yield_b_id TEXT NOT NULL,
+      domain_tag TEXT,
+      contradiction_type TEXT NOT NULL CHECK(contradiction_type IN ('observation_vs_falsification','opposing_confidence')),
+      details TEXT DEFAULT '{}',
+      detected_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(yield_a_id, yield_b_id, contradiction_type, domain_tag)
+    );
+    CREATE INDEX IF NOT EXISTS idx_contradictions_domain ON myr_contradictions(domain_tag);
+    CREATE INDEX IF NOT EXISTS idx_contradictions_updated ON myr_contradictions(updated_at DESC);
+  `);
+}
+
+function migrateApplicationsTable(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS myr_applications (
+      id TEXT PRIMARY KEY,
+      source_yield_id TEXT NOT NULL,
+      applied_by_node_id TEXT NOT NULL,
+      downstream_use TEXT NOT NULL,
+      outcome TEXT,
+      applied_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      signed_by TEXT NOT NULL,
+      signature TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_applications_source ON myr_applications(source_yield_id);
+    CREATE INDEX IF NOT EXISTS idx_applications_created ON myr_applications(created_at DESC);
+  `);
+}
+
+function migrateSubscriptionsTable(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS myr_subscriptions (
+      signal_id TEXT PRIMARY KEY,
+      owner_public_key TEXT NOT NULL,
+      owner_fingerprint TEXT NOT NULL,
+      owner_operator_name TEXT,
+      tags_json TEXT NOT NULL,
+      intent_description TEXT,
+      status TEXT NOT NULL CHECK(status IN ('active','inactive')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'local' CHECK(source IN ('local','remote')),
+      signal_signature TEXT NOT NULL,
+      last_received_from TEXT,
+      hops_remaining INTEGER DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_owner_status
+      ON myr_subscriptions(owner_public_key, status);
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_updated
+      ON myr_subscriptions(updated_at DESC);
+  `);
 }
 
 function generateId(db) {

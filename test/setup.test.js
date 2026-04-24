@@ -286,6 +286,139 @@ describe('setup: headless tunnel token path (env var)', () => {
   });
 });
 
+describe('setup: provider selection and startup flow', () => {
+  it('defaults to tailscale in interactive mode when available', async () => {
+    const { runSetup } = require('../lib/setup');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'myr-setup-tailscale-test-'));
+    const origMyrHome = process.env.MYR_HOME;
+    const origMyrConfig = process.env.MYR_CONFIG;
+    process.env.MYR_HOME = tmpDir;
+    process.env.MYR_CONFIG = path.join(tmpDir, 'config.json');
+
+    let funnelStarted = false;
+    let serverStarted = false;
+    let serverStopped = false;
+
+    try {
+      const result = await runSetup({
+        operatorName: 'tailscaletest',
+        prompt: async () => '',
+        log: () => {},
+        isTailscaleAvailableFn: () => true,
+        startTailscaleFunnelFn: () => { funnelStarted = true; },
+        getTailscaleNodeUrlFn: () => 'https://tailscale-node.ts.net',
+        startServer: async () => {
+          serverStarted = true;
+          return { id: 'server-handle' };
+        },
+        stopServer: async () => {
+          serverStopped = true;
+        },
+        verifyFetch: async () => ({
+          status: 200,
+          body: {
+            public_key: 'd'.repeat(64),
+            operator_name: 'tailscaletest',
+            protocol_version: '1.0.0',
+          },
+        }),
+      });
+
+      assert.equal(result.nodeUrl, 'https://tailscale-node.ts.net');
+      assert.ok(funnelStarted, 'tailscale funnel should be started');
+      assert.ok(serverStarted, 'setup should start local server for verification');
+      assert.ok(serverStopped, 'setup should stop local server after verification');
+      assert.equal(result.config.reachability.provider, 'tailscale');
+      assert.equal(result.config.reachability.mode, 'expose');
+    } finally {
+      if (origMyrHome !== undefined) process.env.MYR_HOME = origMyrHome;
+      else delete process.env.MYR_HOME;
+      if (origMyrConfig !== undefined) process.env.MYR_CONFIG = origMyrConfig;
+      else delete process.env.MYR_CONFIG;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('auto mode falls back to relay when tailscale and cloudflare are unavailable', async () => {
+    const { runSetup } = require('../lib/setup');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'myr-setup-relay-fallback-test-'));
+    const origMyrHome = process.env.MYR_HOME;
+    const origMyrConfig = process.env.MYR_CONFIG;
+    process.env.MYR_HOME = tmpDir;
+    process.env.MYR_CONFIG = path.join(tmpDir, 'config.json');
+
+    let verifyTarget = null;
+    try {
+      const result = await runSetup({
+        operatorName: 'relayfallback',
+        log: () => {},
+        env: { MYR_BOOTSTRAP_RELAY_URL: 'https://relay.bootstrap.test' },
+        isTailscaleAvailableFn: () => false,
+        isCloudflaredInstalledFn: () => true,
+        startTunnelInteractiveFn: async () => {
+          throw new Error('cloudflared startup failed');
+        },
+        verifyFetch: async (url) => {
+          verifyTarget = url;
+          return { status: 200, body: { status: 'ok' } };
+        },
+      });
+
+      assert.equal(result.nodeUrl, 'http://127.0.0.1:3719');
+      assert.equal(result.config.reachability.provider, 'relay');
+      assert.equal(result.config.relay.url, 'https://relay.bootstrap.test');
+      assert.equal(result.config.relay.fallback_only, true);
+      assert.equal(verifyTarget, 'https://relay.bootstrap.test/myr/health');
+    } finally {
+      if (origMyrHome !== undefined) process.env.MYR_HOME = origMyrHome;
+      else delete process.env.MYR_HOME;
+      if (origMyrConfig !== undefined) process.env.MYR_CONFIG = origMyrConfig;
+      else delete process.env.MYR_CONFIG;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('manual provider prompts for URL when not provided', async () => {
+    const { runSetup } = require('../lib/setup');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'myr-setup-manual-test-'));
+    const origMyrHome = process.env.MYR_HOME;
+    const origMyrConfig = process.env.MYR_CONFIG;
+    process.env.MYR_HOME = tmpDir;
+    process.env.MYR_CONFIG = path.join(tmpDir, 'config.json');
+
+    try {
+      const result = await runSetup({
+        operatorName: 'manualtest',
+        tunnelProvider: 'manual',
+        prompt: async (question) => {
+          if (question.includes('Enter public URL')) {
+            return 'https://manual.example.net';
+          }
+          return '';
+        },
+        log: () => {},
+        verifyFetch: async () => ({
+          status: 200,
+          body: {
+            public_key: 'e'.repeat(64),
+            operator_name: 'manualtest',
+            protocol_version: '1.0.0',
+          },
+        }),
+      });
+
+      assert.equal(result.nodeUrl, 'https://manual.example.net');
+      assert.equal(result.config.reachability.provider, 'manual');
+    } finally {
+      if (origMyrHome !== undefined) process.env.MYR_HOME = origMyrHome;
+      else delete process.env.MYR_HOME;
+      if (origMyrConfig !== undefined) process.env.MYR_CONFIG = origMyrConfig;
+      else delete process.env.MYR_CONFIG;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('setup: keypair stored at os.homedir()-relative path', () => {
   it('saveKeypair writes to getNodeKeyPath (which is under os.homedir())', () => {
     const { saveKeypair, getNodeKeyPath, getMyrDir } = require('../lib/node-config');

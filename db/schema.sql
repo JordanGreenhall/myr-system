@@ -124,3 +124,54 @@ CREATE TABLE IF NOT EXISTS myr_traces (
 
 CREATE INDEX IF NOT EXISTS idx_traces_timestamp ON myr_traces(timestamp);
 CREATE INDEX IF NOT EXISTS idx_traces_event_type ON myr_traces(event_type);
+
+CREATE TABLE IF NOT EXISTS myr_contradictions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  yield_a_id TEXT NOT NULL,
+  yield_b_id TEXT NOT NULL,
+  domain_tag TEXT,
+  contradiction_type TEXT NOT NULL CHECK(contradiction_type IN ('observation_vs_falsification','opposing_confidence')),
+  details TEXT DEFAULT '{}',
+  detected_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(yield_a_id, yield_b_id, contradiction_type, domain_tag)
+);
+
+CREATE INDEX IF NOT EXISTS idx_contradictions_domain ON myr_contradictions(domain_tag);
+CREATE INDEX IF NOT EXISTS idx_contradictions_updated ON myr_contradictions(updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS myr_applications (
+  id TEXT PRIMARY KEY,
+  source_yield_id TEXT NOT NULL,
+  applied_by_node_id TEXT NOT NULL,
+  downstream_use TEXT NOT NULL,
+  outcome TEXT,
+  applied_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  signed_by TEXT NOT NULL,
+  signature TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_applications_source ON myr_applications(source_yield_id);
+CREATE INDEX IF NOT EXISTS idx_applications_created ON myr_applications(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS myr_subscriptions (
+  signal_id TEXT PRIMARY KEY,
+  owner_public_key TEXT NOT NULL,
+  owner_fingerprint TEXT NOT NULL,
+  owner_operator_name TEXT,
+  tags_json TEXT NOT NULL,
+  intent_description TEXT,
+  status TEXT NOT NULL CHECK(status IN ('active','inactive')),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'local' CHECK(source IN ('local','remote')),
+  signal_signature TEXT NOT NULL,
+  last_received_from TEXT,
+  hops_remaining INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_subscriptions_owner_status
+  ON myr_subscriptions(owner_public_key, status);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_updated
+  ON myr_subscriptions(updated_at DESC);

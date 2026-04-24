@@ -10,6 +10,11 @@
  *   myr peer approve <fp>         — Approve a pending peer
  *   myr peer list                 — List all known peers
  *   myr sync [--peer <fp>]        — Sync reports from trusted peers
+ *   myr recall ...                — Surface prior relevant yield before work
+ *   myr capture [options]         — Interactive capture or auto-capture from logs
+ *   myr subscribe --tags "..."    — Publish demand signal for tagged yield
+ *   myr unsubscribe --tags "..."  — Withdraw demand signal
+ *   myr governance ...            — Audit/revoke/quarantine governance operations
  *   myr start                     — Start server in foreground
  *   myr status                    — Show node identity and peer status
  */
@@ -18,12 +23,169 @@ const { Command } = require('commander');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { spawnSync } = require('child_process');
 const nodeCrypto = require('crypto');
-const { sign, fingerprint: computeFingerprint } = require('../lib/crypto');
+const chalk = require('chalk');
+const { sign, verify, fingerprint: computeFingerprint } = require('../lib/crypto');
 const { syncPeer: syncPeerCore, makeSignedHeaders, httpFetch, cleanupNonces } = require('../lib/sync');
 const { TOPIC_NAME, discoverPeers, startBackgroundAnnounce } = require('../lib/dht');
 const { verifyNode } = require('../lib/liveness');
 const { verifyPeerFingerprint } = require('../lib/verify');
+const {
+  computeDomainTrust,
+  getPeerDomainTrust,
+  getStage,
+  hasCapability,
+  gatherPeerStats,
+  getStageProgress,
+} = require('../lib/participation');
+const {
+  resolveReachability,
+  probeRelay,
+  manualFallbackInstructions,
+} = require('../lib/reachability');
+const { writeTrace } = require('../lib/trace');
+const { detectContradictions } = require('../lib/contradictions');
+const {
+  DEFAULT_PROPAGATION_HOPS,
+  ensureSubscriptionsSchema,
+  normalizeTags,
+  computeSignalId,
+  createSignedSignal,
+  upsertSubscriptionSignal,
+  listSubscriptions,
+} = require('../lib/subscriptions');
+const INVITE_SCHEMA = 'myr://invite/';
+const DEFAULT_AUTO_SYNC_INTERVAL_MS = 60 * 60 * 1000;
+const DEFAULT_MIN_SYNC_INTERVAL_MS = 15 * 60 * 1000;
+
+function toBase64Url(input) {
+  return Buffer.from(input, 'utf8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function fromBase64Url(input) {
+  const normalized = input.replace(/-/g, '+').replace(/_/g, '/');
+  const padding = normalized.length % 4 ? '='.repeat(4 - (normalized.length % 4)) : '';
+  return Buffer.from(normalized + padding, 'base64').toString('utf8');
+}
+
+function getNodeIdentifier(nodeConfig, keys) {
+  return nodeConfig.node_uuid || computeFingerprint(keys.publicKey);
+}
+
+function parseDurationMs(value, fallbackMs) {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) return value;
+  if (typeof value !== 'string') return fallbackMs;
+  const raw = value.trim().toLowerCase();
+  if (!raw) return fallbackMs;
+  const m = raw.match(/^(\d+)\s*(ms|s|m|h|d)?$/);
+  if (!m) return fallbackMs;
+  const n = parseInt(m[1], 10);
+  if (!Number.isFinite(n) || n <= 0) return fallbackMs;
+  const unit = m[2] || 'ms';
+  const unitMap = {
+    ms: 1,
+    s: 1000,
+    m: 60 * 1000,
+    h: 60 * 60 * 1000,
+    d: 24 * 60 * 60 * 1000,
+  };
+  return n * (unitMap[unit] || 1);
+}
+
+function formatDurationMs(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return 'disabled';
+  if (ms % (24 * 60 * 60 * 1000) === 0) return `${ms / (24 * 60 * 60 * 1000)}d`;
+  if (ms % (60 * 60 * 1000) === 0) return `${ms / (60 * 60 * 1000)}h`;
+  if (ms % (60 * 1000) === 0) return `${ms / (60 * 1000)}m`;
+  if (ms % 1000 === 0) return `${ms / 1000}s`;
+  return `${ms}ms`;
+}
+
+function getAutoSyncSettings(nodeConfig = {}) {
+  const enabled = nodeConfig.auto_sync !== false;
+  const minIntervalMs = parseDurationMs(nodeConfig.min_sync_interval, DEFAULT_MIN_SYNC_INTERVAL_MS);
+  const configuredIntervalMs = parseDurationMs(nodeConfig.auto_sync_interval, DEFAULT_AUTO_SYNC_INTERVAL_MS);
+  const intervalMs = Math.max(configuredIntervalMs, minIntervalMs);
+  return {
+    enabled,
+    intervalMs,
+    minIntervalMs,
+    intervalLabel: formatDurationMs(intervalMs),
+    minIntervalLabel: formatDurationMs(minIntervalMs),
+  };
+}
+
+function inviteSigningMessage(payload) {
+  return [
+    'myr-invite-v1',
+    payload.node_url,
+    payload.operator_name,
+    payload.public_key,
+    payload.fingerprint,
+    payload.exp,
+    payload.token,
+  ].join('\n');
+}
+
+function makeInviteUrl({ nodeConfig, keys, expiresAt, token }) {
+  const fingerprint = computeFingerprint(keys.publicKey);
+  const payload = {
+    v: 1,
+    node_url: nodeConfig.node_url,
+    operator_name: nodeConfig.operator_name || nodeConfig.node_name || 'unknown',
+    public_key: keys.publicKey,
+    fingerprint,
+    exp: expiresAt,
+    token,
+  };
+  payload.sig = sign(inviteSigningMessage(payload), keys.privateKey);
+  return INVITE_SCHEMA + toBase64Url(JSON.stringify(payload));
+}
+
+function parseInviteUrl(inviteUrl) {
+  let token = inviteUrl.trim();
+  if (token.startsWith(INVITE_SCHEMA)) {
+    token = token.slice(INVITE_SCHEMA.length);
+  } else {
+    throw new Error('Invalid invite URL. Expected format: myr://invite/<token>');
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(fromBase64Url(token));
+  } catch {
+    throw new Error('Invalid invite token: could not decode payload');
+  }
+
+  if (!payload || payload.v !== 1 || !payload.node_url || !payload.operator_name || !payload.fingerprint || !payload.public_key || !payload.exp || !payload.token || !payload.sig) {
+    throw new Error('Invalid invite token: missing required fields');
+  }
+
+  const expectedFingerprint = computeFingerprint(payload.public_key);
+  if (payload.fingerprint !== expectedFingerprint) {
+    throw new Error('Invalid invite token: fingerprint does not match public key');
+  }
+
+  const expMillis = Date.parse(payload.exp);
+  if (!Number.isFinite(expMillis)) {
+    throw new Error('Invalid invite token: exp must be a valid timestamp');
+  }
+
+  if (!verify(inviteSigningMessage(payload), payload.sig, payload.public_key)) {
+    throw new Error('Invalid invite token: signature verification failed');
+  }
+
+  if (Date.now() > expMillis) {
+    throw new Error(`Invite expired at ${payload.exp}`);
+  }
+
+  return payload;
+}
 
 // --- Key loading helpers ---
 
@@ -58,6 +220,15 @@ function loadKeypair(config) {
   return {
     publicKey: loadPublicKeyHex(config.keys_path, config.node_id),
     privateKey: loadPrivateKeyHex(config.keys_path, config.node_id),
+  };
+}
+
+function signGovernanceAction({ keys, action, payload }) {
+  const timestamp = new Date().toISOString();
+  const message = `${action}\n${timestamp}\n${JSON.stringify(payload || {})}`;
+  return {
+    timestamp,
+    signature: sign(message, keys.privateKey),
   };
 }
 
@@ -173,6 +344,169 @@ function rejectPeer({ db, identifier }) {
   return { message: `Peer rejected: ${peer.operator_name}`, peer };
 }
 
+function revokePeerGovernance({ db, identifier, keys }) {
+  const peer = findPeer(db, identifier);
+  if (!peer) throw new Error(`No peer found matching "${identifier}"`);
+
+  db.prepare('UPDATE myr_peers SET trust_level = ? WHERE public_key = ?')
+    .run('revoked', peer.public_key);
+
+  const actorFingerprint = computeFingerprint(keys.publicKey);
+  const targetFingerprint = computeFingerprint(peer.public_key);
+  const governanceSig = signGovernanceAction({
+    keys,
+    action: 'governance.revoke',
+    payload: {
+      target_fingerprint: targetFingerprint,
+      operator_name: peer.operator_name || null,
+    },
+  });
+
+  writeTrace(db, {
+    eventType: 'revoke',
+    actorFingerprint,
+    targetFingerprint,
+    outcome: 'success',
+    metadata: {
+      previous_trust_level: peer.trust_level,
+      governance_signature: governanceSig.signature,
+      governance_timestamp: governanceSig.timestamp,
+    },
+  });
+
+  const updated = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(peer.public_key);
+  return {
+    message: `Peer revoked: ${peer.operator_name}`,
+    peer: updated,
+  };
+}
+
+function quarantineYield({ db, yieldId, reason = null, keys }) {
+  const report = db.prepare('SELECT id FROM myr_reports WHERE id = ?').get(yieldId);
+  if (!report) throw new Error(`No report found with id "${yieldId}"`);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS myr_quarantined_yields (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      yield_id TEXT NOT NULL UNIQUE,
+      quarantined_at TEXT NOT NULL,
+      quarantined_by TEXT NOT NULL,
+      operator_signature TEXT NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','released')),
+      metadata TEXT DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_quarantine_status ON myr_quarantined_yields(status);
+  `);
+
+  const actorFingerprint = computeFingerprint(keys.publicKey);
+  const governanceSig = signGovernanceAction({
+    keys,
+    action: 'governance.quarantine',
+    payload: { yield_id: yieldId, reason },
+  });
+  const now = new Date().toISOString();
+
+  db.prepare(`
+    INSERT INTO myr_quarantined_yields (
+      yield_id, quarantined_at, quarantined_by, operator_signature, reason, status, metadata
+    ) VALUES (?, ?, ?, ?, ?, 'active', ?)
+    ON CONFLICT(yield_id) DO UPDATE SET
+      quarantined_at = excluded.quarantined_at,
+      quarantined_by = excluded.quarantined_by,
+      operator_signature = excluded.operator_signature,
+      reason = excluded.reason,
+      status = 'active',
+      metadata = excluded.metadata
+  `).run(
+    yieldId,
+    now,
+    actorFingerprint,
+    governanceSig.signature,
+    reason,
+    JSON.stringify({ governance_timestamp: governanceSig.timestamp })
+  );
+
+  writeTrace(db, {
+    eventType: 'quarantine',
+    actorFingerprint,
+    outcome: 'success',
+    metadata: {
+      yield_id: yieldId,
+      reason,
+      governance_signature: governanceSig.signature,
+      governance_timestamp: governanceSig.timestamp,
+    },
+  });
+
+  const quarantine = db.prepare('SELECT * FROM myr_quarantined_yields WHERE yield_id = ?').get(yieldId);
+  return {
+    message: `Yield quarantined: ${yieldId}`,
+    quarantine,
+  };
+}
+
+function governanceAudit({ db, limit = 200 }) {
+  const clamped = Math.max(1, Math.min(limit, 2000));
+  const traces = db.prepare(`
+    SELECT *
+    FROM myr_traces
+    WHERE event_type IN ('approve', 'stage_change', 'revoke', 'sync_pull', 'sync_push', 'relay_sync', 'quarantine')
+    ORDER BY timestamp DESC
+    LIMIT ?
+  `).all(clamped);
+
+  let stageRows = [];
+  try {
+    stageRows = db.prepare(`
+      SELECT operator_name, public_key, participation_stage, stage_changed_at, stage_evidence
+      FROM myr_peers
+      WHERE stage_changed_at IS NOT NULL
+      ORDER BY stage_changed_at DESC
+      LIMIT ?
+    `).all(clamped);
+  } catch (_) {
+    stageRows = [];
+  }
+
+  let quarantinedYields = [];
+  try {
+    quarantinedYields = db.prepare(`
+      SELECT yield_id, quarantined_at, quarantined_by, operator_signature, reason, status, metadata
+      FROM myr_quarantined_yields
+      ORDER BY quarantined_at DESC
+      LIMIT ?
+    `).all(clamped);
+  } catch (_) {
+    quarantinedYields = [];
+  }
+
+  return {
+    limit: clamped,
+    approvals: traces.filter((t) => t.event_type === 'approve'),
+    stageChanges: [
+      ...traces.filter((t) => t.event_type === 'stage_change'),
+      ...stageRows.map((row) => ({
+        event_type: 'stage_change',
+        timestamp: row.stage_changed_at,
+        actor_fingerprint: null,
+        target_fingerprint: computeFingerprint(row.public_key),
+        outcome: 'success',
+        metadata: JSON.stringify({
+          source: 'peer_stage_column',
+          operator_name: row.operator_name || null,
+          participation_stage: row.participation_stage || null,
+          stage_evidence: row.stage_evidence || null,
+        }),
+      })),
+    ].sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || ''))),
+    revocations: traces.filter((t) => t.event_type === 'revoke'),
+    syncEvents: traces.filter((t) => ['sync_pull', 'sync_push', 'relay_sync'].includes(t.event_type)),
+    quarantines: traces.filter((t) => t.event_type === 'quarantine'),
+    quarantinedYields,
+  };
+}
+
 /**
  * List all known peers.
  */
@@ -196,10 +530,212 @@ function getPeerFingerprint({ db, name }) {
   return { name: peer.operator_name, fingerprint: computeFingerprint(peer.public_key) };
 }
 
+async function propagateSubscriptionSignal({ db, keys, signal, hops, fetch: fetchFn }) {
+  fetchFn = fetchFn || httpFetch;
+  const hopsRemaining = Math.max(0, parseInt(hops, 10) || 0);
+  if (hopsRemaining <= 0) {
+    return { attempted: 0, delivered: 0, failed: 0 };
+  }
+
+  const peers = db.prepare(`
+    SELECT public_key, operator_name, peer_url
+    FROM myr_peers
+    WHERE trust_level = 'trusted'
+      AND peer_url IS NOT NULL
+      AND peer_url != ''
+  `).all();
+
+  let delivered = 0;
+  let failed = 0;
+  for (const peer of peers) {
+    const payload = {
+      ...signal,
+      hops_remaining: hopsRemaining,
+      propagated_by: computeFingerprint(keys.publicKey),
+    };
+    const headers = makeSignedHeaders({
+      method: 'POST',
+      urlPath: '/myr/subscriptions',
+      body: payload,
+      privateKey: keys.privateKey,
+      publicKey: keys.publicKey,
+    });
+
+    try {
+      const res = await fetchFn(peer.peer_url.replace(/\/+$/, '') + '/myr/subscriptions', {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'content-type': 'application/json',
+        },
+        body: payload,
+      });
+      if (res.status >= 200 && res.status < 300) delivered++;
+      else failed++;
+    } catch {
+      failed++;
+    }
+  }
+
+  return { attempted: peers.length, delivered, failed };
+}
+
+async function publishSubscription({ db, keys, operatorName, tags, intentDescription, status = 'active', hops, fetch: fetchFn }) {
+  ensureSubscriptionsSchema(db);
+  const normalizedTags = normalizeTags(tags);
+  if (normalizedTags.length === 0) {
+    throw new Error('At least one tag is required');
+  }
+
+  const signalId = computeSignalId(keys.publicKey, normalizedTags);
+  const existing = db.prepare(
+    'SELECT created_at FROM myr_subscriptions WHERE signal_id = ?'
+  ).get(signalId);
+
+  const signal = createSignedSignal({
+    ownerPublicKey: keys.publicKey,
+    ownerOperatorName: operatorName || null,
+    tags: normalizedTags,
+    intentDescription: intentDescription || null,
+    status,
+    privateKey: keys.privateKey,
+    createdAt: existing ? existing.created_at : undefined,
+    signalId,
+  });
+
+  const parsedHops = Number.isFinite(Number(hops))
+    ? Number(hops)
+    : DEFAULT_PROPAGATION_HOPS;
+  const maxHops = Math.max(0, Math.min(parsedHops, 5));
+  const stored = upsertSubscriptionSignal(db, signal, {
+    source: 'local',
+    receivedFrom: keys.publicKey,
+    hopsRemaining: maxHops,
+  });
+  const propagation = await propagateSubscriptionSignal({
+    db,
+    keys,
+    signal,
+    hops: maxHops,
+    fetch: fetchFn,
+  });
+
+  return { subscription: stored, propagation };
+}
+
+function parseDomainTags(raw) {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    } catch (_) {
+      return raw.split(',').map((t) => t.trim()).filter(Boolean);
+    }
+  }
+  return [];
+}
+
+function inferTargetDomains(db) {
+  const rows = db.prepare(`
+    SELECT domain_tags
+    FROM myr_reports
+    WHERE share_network = 1
+    ORDER BY created_at DESC
+    LIMIT 200
+  `).all();
+
+  const counts = new Map();
+  for (const row of rows) {
+    const tags = parseDomainTags(row.domain_tags).map((t) => String(t).toLowerCase());
+    for (const tag of tags) {
+      if (!tag) continue;
+      counts.set(tag, (counts.get(tag) || 0) + 1);
+    }
+  }
+
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([domain]) => domain);
+}
+
+function listContradictions({ db, domain = null }) {
+  return detectContradictions(db, { domain });
+}
+
+function routePeersForSync({ db, peers, participationStage = 'provisional', targetDomains = [] }) {
+  const stageName = getStage(participationStage) ? participationStage : 'provisional';
+  const stageDef = getStage(stageName);
+  const maxSyncPeers = stageDef.capabilities.maxSyncPeers;
+  const domains = targetDomains.length > 0 ? targetDomains : inferTargetDomains(db);
+
+  const ranked = peers.map((peer) => {
+    const domainTrustScore = domains.length > 0
+      ? domains.reduce((best, domain) => {
+        const trust = computeDomainTrust(db, peer.operator_name, domain);
+        return Math.max(best, trust.score || 0);
+      }, 0)
+      : (() => {
+        const trustMap = getPeerDomainTrust(db, peer.operator_name);
+        const scores = Object.values(trustMap).map((v) => v.score || 0);
+        if (scores.length === 0) return 0;
+        return Math.max(...scores);
+      })();
+
+    const ratingRow = db.prepare(`
+      SELECT AVG(operator_rating) AS avg
+      FROM myr_reports
+      WHERE imported_from = ?
+        AND operator_rating IS NOT NULL
+    `).get(peer.operator_name);
+    const verificationRating = ratingRow && ratingRow.avg !== null ? Number(ratingRow.avg) : 0;
+
+    const falsRow = db.prepare(`
+      SELECT COUNT(*) AS cnt
+      FROM myr_reports
+      WHERE imported_from = ?
+        AND yield_type = 'falsification'
+    `).get(peer.operator_name);
+    const falsifications = falsRow ? falsRow.cnt : 0;
+
+    const recencyIso = peer.last_sync_at || peer.added_at || null;
+    const recencyMs = recencyIso ? new Date(recencyIso).getTime() : 0;
+
+    return {
+      peer,
+      domainTrustScore,
+      verificationRating,
+      recencyIso,
+      recencyMs,
+      falsifications,
+      hasFalsification: falsifications > 0,
+    };
+  }).sort((a, b) =>
+    ((b.hasFalsification ? 1 : 0) - (a.hasFalsification ? 1 : 0)) ||
+    (b.domainTrustScore - a.domainTrustScore) ||
+    (b.verificationRating - a.verificationRating) ||
+    (b.recencyMs - a.recencyMs)
+  );
+
+  const selected = Number.isFinite(maxSyncPeers) ? ranked.slice(0, maxSyncPeers) : ranked;
+  const skipped = Number.isFinite(maxSyncPeers) ? ranked.slice(maxSyncPeers) : [];
+
+  return {
+    stage: stageName,
+    maxSyncPeers,
+    targetDomains: domains,
+    ranked,
+    selected,
+    skipped,
+  };
+}
+
 /**
  * Sync reports from a specific trusted peer.
  */
-async function syncPeer({ db, peerName, keys, fetch: fetchFn }) {
+async function syncPeer({ db, peerName, keys, fetch: fetchFn, nodeConfig }) {
   const peer = findPeer(db, peerName);
   if (!peer) throw new Error(`No peer found matching "${peerName}"`);
   if (peer.trust_level !== 'trusted') {
@@ -209,16 +745,113 @@ async function syncPeer({ db, peerName, keys, fetch: fetchFn }) {
   const syncOpts = { db, peer, keys };
   if (fetchFn) syncOpts.fetch = fetchFn;
 
+  // Wire relay fallback from node config into the core sync function
+  const relay = nodeConfig && nodeConfig.relay;
+  if (relay && relay.enabled && relay.url) {
+    syncOpts.relayConfig = { url: relay.url, fallbackOnly: relay.fallback_only !== false };
+  }
+
   const result = await syncPeerCore(syncOpts);
 
   if (result.peerNotTrusted) {
     throw new Error(`Peer "${peer.operator_name}" has not approved us yet.`);
   }
 
+  const relayNote = result.relayUsed ? ' (via relay)' : '';
   return {
-    message: `Synced ${result.imported} new report${result.imported !== 1 ? 's' : ''} from ${peer.operator_name}`,
+    message: `Synced ${result.imported} new report${result.imported !== 1 ? 's' : ''} from ${peer.operator_name}${relayNote}`,
     imported: result.imported,
     peerName: peer.operator_name,
+    relayUsed: !!result.relayUsed,
+  };
+}
+
+async function syncTrustedPeers({
+  db,
+  keys,
+  nodeConfig,
+  onMessage = () => {},
+  onError = () => {},
+  trigger = 'manual',
+}) {
+  const peers = db.prepare("SELECT * FROM myr_peers WHERE trust_level = 'trusted' AND auto_sync = 1").all();
+  if (peers.length === 0) {
+    return { status: 'no_peers', totalImported: 0, selectedCount: 0, skippedCount: 0 };
+  }
+
+  const participationStage = nodeConfig.participation_stage || 'provisional';
+  if (!hasCapability(participationStage, 'canSync')) {
+    throw new Error(`Current participation stage "${participationStage}" cannot sync.`);
+  }
+
+  const route = routePeersForSync({ db, peers, participationStage });
+  if (route.selected.length === 0) {
+    return { status: 'no_selected', totalImported: 0, selectedCount: 0, skippedCount: route.skipped.length };
+  }
+
+  let totalImported = 0;
+  for (let i = 0; i < route.selected.length; i++) {
+    const ranked = route.selected[i];
+    const peer = ranked.peer;
+    try {
+      writeTrace(db, {
+        eventType: 'sync_pull',
+        actorFingerprint: computeFingerprint(keys.publicKey),
+        targetFingerprint: computeFingerprint(peer.public_key),
+        outcome: 'success',
+        metadata: {
+          trigger,
+          routing: {
+            rank: i + 1,
+            selected: true,
+            stage: route.stage,
+            max_sync_peers: route.maxSyncPeers,
+            target_domains: route.targetDomains,
+            domain_trust_score: ranked.domainTrustScore,
+            verification_rating: ranked.verificationRating,
+            recency: ranked.recencyIso,
+            falsifications: ranked.falsifications,
+          },
+        },
+      });
+      const result = await syncPeer({ db, peerName: peer.operator_name, keys, nodeConfig });
+      onMessage(result.message);
+      totalImported += result.imported;
+    } catch (err) {
+      onError(`  Failed to sync ${peer.operator_name}: ${err.message}`);
+    }
+  }
+
+  if (route.skipped.length > 0) {
+    for (const skipped of route.skipped) {
+      writeTrace(db, {
+        eventType: 'sync_pull',
+        actorFingerprint: computeFingerprint(keys.publicKey),
+        targetFingerprint: computeFingerprint(skipped.peer.public_key),
+        outcome: 'failure',
+        metadata: {
+          trigger,
+          routing: {
+            selected: false,
+            reason: 'participation_stage_limit',
+            stage: route.stage,
+            max_sync_peers: route.maxSyncPeers,
+            target_domains: route.targetDomains,
+            domain_trust_score: skipped.domainTrustScore,
+            verification_rating: skipped.verificationRating,
+            recency: skipped.recencyIso,
+            falsifications: skipped.falsifications,
+          },
+        },
+      });
+    }
+  }
+
+  return {
+    status: 'ok',
+    totalImported,
+    selectedCount: route.selected.length,
+    skippedCount: route.skipped.length,
   };
 }
 
@@ -395,7 +1028,7 @@ function getDbFromNodeConfig(nodeConfig) {
       CREATE TABLE IF NOT EXISTS myr_traces (
         trace_id TEXT PRIMARY KEY,
         timestamp TEXT NOT NULL,
-        event_type TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK(event_type IN ('introduce','approve','share','sync_pull','sync_push','verify','reject','discover','relay_sync','revoke','quarantine','stage_change')),
         actor_fingerprint TEXT NOT NULL,
         target_fingerprint TEXT,
         artifact_signature TEXT,
@@ -404,6 +1037,30 @@ function getDbFromNodeConfig(nodeConfig) {
         metadata TEXT DEFAULT '{}'
       );
       CREATE INDEX IF NOT EXISTS idx_traces_timestamp ON myr_traces(timestamp);
+      CREATE TABLE IF NOT EXISTS myr_quarantined_yields (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        yield_id TEXT NOT NULL UNIQUE,
+        quarantined_at TEXT NOT NULL,
+        quarantined_by TEXT NOT NULL,
+        operator_signature TEXT NOT NULL,
+        reason TEXT,
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','released')),
+        metadata TEXT DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_quarantine_status ON myr_quarantined_yields(status);
+      CREATE TABLE IF NOT EXISTS myr_contradictions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        yield_a_id TEXT NOT NULL,
+        yield_b_id TEXT NOT NULL,
+        domain_tag TEXT,
+        contradiction_type TEXT NOT NULL CHECK(contradiction_type IN ('observation_vs_falsification','opposing_confidence')),
+        details TEXT DEFAULT '{}',
+        detected_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(yield_a_id, yield_b_id, contradiction_type, domain_tag)
+      );
+      CREATE INDEX IF NOT EXISTS idx_contradictions_domain ON myr_contradictions(domain_tag);
+      CREATE INDEX IF NOT EXISTS idx_contradictions_updated ON myr_contradictions(updated_at DESC);
     `);
     return db;
   }
@@ -416,7 +1073,7 @@ function getDbFromNodeConfig(nodeConfig) {
 // --- CLI entry point ---
 
 if (require.main === module) {
-  const { loadNodeConfig } = require('../lib/node-config');
+  const { loadNodeConfig, saveNodeConfig } = require('../lib/node-config');
 
   const program = new Command();
   program
@@ -424,59 +1081,102 @@ if (require.main === module) {
     .description('MYR network node management CLI')
     .version('1.0.0');
 
+  async function runSetupCommand(opts = {}) {
+    const { runSetup } = require('../lib/setup');
+    const readline = require('readline');
+
+    const port = opts.port || 3719;
+
+    const prompt = opts.operatorName ? null : async (question) => {
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      return new Promise((resolve) => {
+        rl.question(question, (answer) => {
+          rl.close();
+          resolve(answer.trim());
+        });
+      });
+    };
+
+    console.log('\nMYR Node Setup\n');
+
+    try {
+      const startServer = async ({ config, keypair }) => {
+        const db = getDbFromNodeConfig(config);
+        const app = createApp({
+          config,
+          db,
+          publicKeyHex: keypair.publicKey,
+          privateKeyHex: keypair.privateKey,
+        });
+
+        const server = await new Promise((resolve, reject) => {
+          const s = app.listen(port, () => resolve(s));
+          s.on('error', (err) => {
+            db.close();
+            reject(err);
+          });
+        });
+
+        return { server, db };
+      };
+
+      const stopServer = async (handle) => {
+        await new Promise((resolve) => handle.server.close(resolve));
+        handle.db.close();
+      };
+
+      const result = await runSetup({
+        operatorName: opts.operatorName,
+        publicUrl: opts.publicUrl,
+        tunnelProvider: opts.tunnelProvider,
+        tunnelToken: opts.tunnelToken,
+        port,
+        log: console.log,
+        prompt,
+        startServer,
+        stopServer,
+      });
+
+      console.log('\n✓ Node is live.\n');
+      console.log('Your node identity:');
+      console.log(`  Name:        ${result.config.operator_name}`);
+      console.log(`  Fingerprint: ${computeFingerprint(result.keypair.publicKey)}`);
+      console.log(`  URL:         ${result.nodeUrl}`);
+      console.log('\nFast first-value path:');
+      console.log('  1) Capture your first MYR:');
+      console.log('     myr capture');
+      console.log('  2) Create an invite link for a peer:');
+      console.log('     myr invite create');
+      console.log('  3) Peer joins from the invite URL:');
+      console.log('     myr join "myr://invite/<token>"');
+      console.log('');
+
+      if (result.tunnelProcess) {
+        result.tunnelProcess.kill();
+      }
+    } catch (err) {
+      console.error('\nSetup failed:', err.message);
+      process.exit(1);
+    }
+  }
+
   // ── myr setup ──────────────────────────────────────────────────────────────
   program
     .command('setup')
-    .description('Set up this node: generate keypair, provision tunnel, verify public URL')
+    .description('Set up this node with automatic onboarding defaults')
     .option('--operator-name <name>', 'Operator name (skips interactive prompt)')
-    .option('--public-url <url>', 'Use this URL instead of provisioning a Cloudflare Tunnel')
-    .option('--tunnel-token <token>', 'Cloudflare Tunnel token for headless setup (or set CLOUDFLARE_TUNNEL_TOKEN)')
+    .action(runSetupCommand);
+
+  // ── myr setup-advanced ─────────────────────────────────────────────────────
+  program
+    .command('setup-advanced')
+    .description('Set up this node with manual reachability controls')
+    .option('--operator-name <name>', 'Operator name (skips interactive prompt)')
+    .option('--public-url <url>', 'Use this URL directly for reachability')
+    .option('--tunnel-provider <provider>', 'Reachability provider: auto | cloudflare | tailscale | manual | relay')
+    .option('--tunnel-token <token>', 'Cloudflare tunnel token for headless setup')
     .option('--port <port>', 'Server port (default: 3719)', parseInt)
-    .action(async (opts) => {
-      const { runSetup } = require('../lib/setup');
-      const readline = require('readline');
-
-      const port = opts.port || 3719;
-
-      const prompt = opts.operatorName ? null : async (question) => {
-        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-        return new Promise((resolve) => {
-          rl.question(question, (answer) => {
-            rl.close();
-            resolve(answer.trim());
-          });
-        });
-      };
-
-      console.log('\nMYR Node Setup\n');
-
-      try {
-        const result = await runSetup({
-          operatorName: opts.operatorName,
-          publicUrl: opts.publicUrl,
-          tunnelToken: opts.tunnelToken,
-          port,
-          log: console.log,
-          prompt,
-        });
-
-        console.log('\n✓ Node is live.\n');
-        console.log('Your node identity:');
-        console.log(`  Name:        ${result.config.operator_name}`);
-        console.log(`  Fingerprint: ${computeFingerprint(result.keypair.publicKey)}`);
-        console.log(`  URL:         ${result.nodeUrl}`);
-        console.log('\nShare this to invite peers:');
-        console.log(`  myr peer add --url ${result.nodeUrl}`);
-        console.log('');
-
-        if (result.tunnelProcess) {
-          result.tunnelProcess.kill();
-        }
-      } catch (err) {
-        console.error('\nSetup failed:', err.message);
-        process.exit(1);
-      }
-    });
+    .action(runSetupCommand);
 
   // ── myr peer ────────────────────────────────────────────────────────────────
   const peerCmd = program
@@ -589,7 +1289,7 @@ if (require.main === module) {
   // myr peer discover [--timeout <ms>] [--auto-introduce]
   peerCmd
     .command('discover')
-    .description('Discover peers on the DHT network (myr-network-v1)')
+    .description('Discover peers on the decentralized network')
     .option('--timeout <ms>', 'Discovery timeout in milliseconds (default: 30000)', parseInt)
     .option('--auto-introduce', 'Automatically introduce to each discovered node not already a peer')
     .action(async (opts) => {
@@ -605,7 +1305,7 @@ if (require.main === module) {
         const keys = loadKeypair(nodeConfig);
         const timeoutMs = opts.timeout || 30000;
 
-        console.log(`Scanning ${TOPIC_NAME} (DHT)...`);
+        console.log(`Scanning ${TOPIC_NAME}...`);
         const { writeTrace } = require('../lib/trace');
 
         const discovered = await discoverPeers({ timeoutMs });
@@ -683,6 +1383,208 @@ if (require.main === module) {
       try {
         db = getDbFromNodeConfig(nodeConfig);
         const result = rejectPeer({ db, identifier: fingerprint });
+        console.log(result.message);
+      } catch (err) {
+        console.error(err.message);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
+  // ── myr subscribe / unsubscribe ────────────────────────────────────────────
+  program
+    .command('subscribe')
+    .description('Publish a demand signal for domain-tagged yield')
+    .requiredOption('--tags <tags>', 'Comma-separated domain tags (for example: "cryptography,networking")')
+    .option('--intent <text>', 'Optional intent description for these tags')
+    .option('--hops <n>', 'Propagation depth in hops (default: 2)', parseInt)
+    .action(async (opts) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error('Node not configured. Run: myr setup');
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        db = getDbFromNodeConfig(nodeConfig);
+        const keys = loadKeypair(nodeConfig);
+        const result = await publishSubscription({
+          db,
+          keys,
+          operatorName: nodeConfig.operator_name || nodeConfig.node_name || null,
+          tags: opts.tags,
+          intentDescription: opts.intent || null,
+          status: 'active',
+          hops: opts.hops,
+        });
+        console.log(`Subscription active for tags: ${result.subscription.tags.join(', ')}`);
+        console.log(
+          `Propagation: attempted ${result.propagation.attempted}, delivered ${result.propagation.delivered}, failed ${result.propagation.failed}`
+        );
+      } catch (err) {
+        console.error(err.message);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
+  program
+    .command('unsubscribe')
+    .description('Withdraw a demand signal for domain-tagged yield')
+    .requiredOption('--tags <tags>', 'Comma-separated domain tags')
+    .option('--hops <n>', 'Propagation depth in hops (default: 2)', parseInt)
+    .action(async (opts) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error('Node not configured. Run: myr setup');
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        db = getDbFromNodeConfig(nodeConfig);
+        const keys = loadKeypair(nodeConfig);
+        const result = await publishSubscription({
+          db,
+          keys,
+          operatorName: nodeConfig.operator_name || nodeConfig.node_name || null,
+          tags: opts.tags,
+          intentDescription: null,
+          status: 'inactive',
+          hops: opts.hops,
+        });
+        console.log(`Subscription withdrawn for tags: ${result.subscription.tags.join(', ')}`);
+        console.log(
+          `Propagation: attempted ${result.propagation.attempted}, delivered ${result.propagation.delivered}, failed ${result.propagation.failed}`
+        );
+      } catch (err) {
+        console.error(err.message);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
+  program
+    .command('subscriptions')
+    .description('List local demand signals')
+    .option('--all', 'Include inactive subscriptions')
+    .action((opts) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error('Node not configured. Run: myr setup');
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        db = getDbFromNodeConfig(nodeConfig);
+        const keys = loadKeypair(nodeConfig);
+        const rows = listSubscriptions(db, {
+          ownerPublicKey: keys.publicKey,
+          includeInactive: !!opts.all,
+        });
+        if (rows.length === 0) {
+          console.log('No subscriptions configured.');
+          return;
+        }
+
+        for (const row of rows) {
+          const intent = row.intent_description ? ` | intent: ${row.intent_description}` : '';
+          console.log(`${row.status.padEnd(8)} ${row.tags.join(', ')}${intent}`);
+        }
+      } catch (err) {
+        console.error(err.message);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
+  // ── myr governance ────────────────────────────────────────────────────────
+  const governanceCmd = program
+    .command('governance')
+    .description('Governance audit and intervention tools');
+
+  governanceCmd
+    .command('audit')
+    .description('Show governance audit trail (approvals, stage changes, revocations, sync events)')
+    .option('--limit <n>', 'Max rows to include (default: 200)', parseInt, 200)
+    .option('--json', 'Output as JSON')
+    .action((opts) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error('Node not configured. Run: myr setup');
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        db = getDbFromNodeConfig(nodeConfig);
+        const report = governanceAudit({ db, limit: opts.limit });
+        if (opts.json) {
+          console.log(JSON.stringify(report, null, 2));
+          return;
+        }
+        console.log(`Governance audit (limit=${report.limit})`);
+        console.log(`  approvals: ${report.approvals.length}`);
+        console.log(`  stage changes: ${report.stageChanges.length}`);
+        console.log(`  revocations: ${report.revocations.length}`);
+        console.log(`  sync events: ${report.syncEvents.length}`);
+        console.log(`  quarantine actions: ${report.quarantines.length}`);
+        console.log(`  active quarantined yields: ${report.quarantinedYields.filter((q) => q.status === 'active').length}`);
+      } catch (err) {
+        console.error(err.message);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
+  governanceCmd
+    .command('revoke <fingerprint>')
+    .description('Revoke a peer by fingerprint/name and block future sync')
+    .action((fingerprint) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error('Node not configured. Run: myr setup');
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        db = getDbFromNodeConfig(nodeConfig);
+        const keys = loadKeypair(nodeConfig);
+        const result = revokePeerGovernance({ db, identifier: fingerprint, keys });
+        console.log(result.message);
+        console.log(`  Fingerprint: ${computeFingerprint(result.peer.public_key)}`);
+      } catch (err) {
+        console.error(err.message);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
+  governanceCmd
+    .command('quarantine <yieldId>')
+    .description('Quarantine a suspicious yield so recall excludes it')
+    .option('--reason <text>', 'Optional reason for quarantine')
+    .action((yieldId, opts) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error('Node not configured. Run: myr setup');
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        db = getDbFromNodeConfig(nodeConfig);
+        const keys = loadKeypair(nodeConfig);
+        const result = quarantineYield({ db, yieldId, reason: opts.reason || null, keys });
         console.log(result.message);
       } catch (err) {
         console.error(err.message);
@@ -777,26 +1679,26 @@ if (require.main === module) {
         const keys = loadKeypair(nodeConfig);
 
         if (opts.peer) {
-          const result = await syncPeer({ db, peerName: opts.peer, keys });
+          const result = await syncPeer({ db, peerName: opts.peer, keys, nodeConfig });
           console.log(result.message);
         } else {
-          const peers = db.prepare("SELECT * FROM myr_peers WHERE trust_level = 'trusted' AND auto_sync = 1").all();
-          if (peers.length === 0) {
+          const summary = await syncTrustedPeers({
+            db,
+            keys,
+            nodeConfig,
+            onMessage: (msg) => console.log(msg),
+            onError: (msg) => console.error(msg),
+            trigger: 'manual',
+          });
+          if (summary.status === 'no_peers') {
             console.log('No trusted peers to sync from.');
             return;
           }
-
-          let totalImported = 0;
-          for (const peer of peers) {
-            try {
-              const result = await syncPeer({ db, peerName: peer.operator_name, keys });
-              console.log(result.message);
-              totalImported += result.imported;
-            } catch (err) {
-              console.error(`  Failed to sync ${peer.operator_name}: ${err.message}`);
-            }
+          if (summary.status === 'no_selected') {
+            console.log('No peers selected for sync after stage/routing checks.');
+            return;
           }
-          console.log(`\nSync complete: ${totalImported} new report(s) imported.`);
+          console.log(`\nSync complete: ${summary.totalImported} new report(s) imported.`);
         }
 
         cleanupNonces(db);
@@ -851,10 +1753,12 @@ if (require.main === module) {
     .command('start')
     .description('Start the MYR server in the foreground (for VPS/systemd use)')
     .option('--port <port>', 'Override server port', parseInt)
-    .action((opts) => {
+    .option('--json', 'Output startup status as JSON')
+    .addHelpText('after', '\nExamples:\n  myr start\n  myr start --port 3720\n  myr start --json')
+    .action(async (opts) => {
       const nodeConfig = loadNodeConfig();
       if (!nodeConfig) {
-        console.error('Node not configured. Run: myr setup');
+        console.error(chalk.red('Node not configured. Run: myr setup'));
         process.exit(1);
       }
 
@@ -862,31 +1766,132 @@ if (require.main === module) {
 
       const port = opts.port || nodeConfig.port || 3719;
       const nodeUrl = nodeConfig.node_url || `http://localhost:${port}`;
-      const db = getDbFromNodeConfig(nodeConfig);
-      const keys = loadKeypair(nodeConfig);
+      const reachability = resolveReachability({ nodeConfig: { ...nodeConfig, port } });
+      const effectiveConfig = { ...nodeConfig, port };
+      let relayProbe = null;
+
+      if (reachability.relay) {
+        effectiveConfig.relay = {
+          enabled: true,
+          url: reachability.relay.url,
+          fallback_only: reachability.relay.fallback_only !== false,
+        };
+        const priorRelay = nodeConfig.relay || {};
+        const shouldPersistRelay =
+          priorRelay.enabled !== effectiveConfig.relay.enabled ||
+          priorRelay.url !== effectiveConfig.relay.url ||
+          (priorRelay.fallback_only !== false) !== effectiveConfig.relay.fallback_only;
+        if (shouldPersistRelay) {
+          saveNodeConfig({ ...nodeConfig, relay: effectiveConfig.relay });
+        }
+        relayProbe = await probeRelay({ relayUrl: effectiveConfig.relay.url });
+      }
+
+      const db = getDbFromNodeConfig(effectiveConfig);
+      const keys = loadKeypair(effectiveConfig);
+      const autoSync = getAutoSyncSettings(effectiveConfig);
 
       const app = createApp({
-        config: { ...nodeConfig, port },
+        config: effectiveConfig,
         db,
         publicKeyHex: keys.publicKey,
         privateKeyHex: keys.privateKey,
       });
 
       let dhtAnnouncer = null;
+      let autoSyncTimer = null;
+      let autoSyncRunning = false;
+
+      async function runAutoSync(trigger) {
+        if (!autoSync.enabled || autoSyncRunning) return;
+        autoSyncRunning = true;
+        try {
+          const summary = await syncTrustedPeers({
+            db,
+            keys,
+            nodeConfig: effectiveConfig,
+            onMessage: (msg) => {
+              if (!opts.json) console.log(`[auto-sync] ${msg}`);
+            },
+            onError: (msg) => console.error(`[auto-sync] ${msg}`),
+            trigger,
+          });
+          if (!opts.json && summary.status === 'ok') {
+            console.log(
+              `[auto-sync] cycle complete: ${summary.totalImported} new report(s), ` +
+              `${summary.selectedCount} peer(s) synced, ${summary.skippedCount} peer(s) deferred`
+            );
+          }
+        } catch (err) {
+          console.error(`[auto-sync] ${err.message}`);
+        } finally {
+          cleanupNonces(db);
+          autoSyncRunning = false;
+        }
+      }
 
       const server = app.listen(port, () => {
-        console.log(`MYR node server started`);
-        console.log(`  Operator: ${nodeConfig.operator_name}`);
-        console.log(`  URL:      ${nodeUrl}`);
-        console.log(`  Port:     ${port}`);
-        console.log(`  Discovery: ${nodeUrl}/.well-known/myr-node`);
+        const peers = listPeers({ db });
+        const trustedPeers = peers.filter((p) => p.trust_level === 'trusted');
+        const reachabilityMethod = reachability.relay
+          ? 'relay'
+          : (reachability.method === 'direct-public' ? 'direct-public' : 'local-only');
+        const startupStatus = {
+          status: 'started',
+          nodeId: getNodeIdentifier(nodeConfig, keys),
+          operatorName: nodeConfig.operator_name || nodeConfig.node_name || null,
+          fingerprint: computeFingerprint(keys.publicKey),
+          nodeUrl,
+          port,
+          reachabilityMethod,
+          indirectConnection: !!reachability.nat.behindNatLikely,
+          indirectReason: reachability.nat.reason,
+          fallbackChain: reachability.fallbackChain,
+          peerCount: peers.length,
+          trustedPeerCount: trustedPeers.length,
+          dhtTopic: effectiveConfig.discovery && effectiveConfig.discovery.dht_enabled ? TOPIC_NAME : null,
+          relay: effectiveConfig.relay && effectiveConfig.relay.enabled
+            ? {
+              url: effectiveConfig.relay.url,
+              fallbackOnly: effectiveConfig.relay.fallback_only !== false,
+              source: reachability.relay ? reachability.relay.source : 'configured',
+              status: relayProbe ? (relayProbe.ok ? 'reachable' : 'unreachable') : 'unknown',
+            }
+            : null,
+          autoSync: {
+            enabled: autoSync.enabled,
+            interval: autoSync.intervalLabel,
+            minInterval: autoSync.minIntervalLabel,
+          },
+        };
+
+        if (reachabilityMethod === 'relay' && relayProbe && !relayProbe.ok) {
+          startupStatus.relayError = relayProbe.reason;
+          startupStatus.manualFallback = manualFallbackInstructions({ port });
+        }
+
+        if (opts.json) {
+          console.log(JSON.stringify(startupStatus, null, 2));
+        } else {
+          console.log(chalk.green('MYR node server started'));
+          console.log(`  Node ID:      ${startupStatus.nodeId}`);
+          console.log(`  Operator:     ${startupStatus.operatorName || 'unknown'}`);
+          console.log(`  Fingerprint:  ${startupStatus.fingerprint}`);
+          console.log(`  URL:          ${startupStatus.nodeUrl}`);
+          console.log(`  Port:         ${startupStatus.port}`);
+          console.log(`  Reachability: ${startupStatus.reachabilityMethod}`);
+          console.log(`  Connectivity: ${startupStatus.indirectConnection ? `indirect (${startupStatus.indirectReason})` : 'direct'}`);
+          console.log(`  Peers:        ${startupStatus.peerCount} (${startupStatus.trustedPeerCount} trusted)`);
+          console.log(`  Auto-sync:    ${autoSync.enabled ? `enabled (${autoSync.intervalLabel})` : 'disabled'}`);
+          console.log(`  Discovery:    ${nodeUrl}/.well-known/myr-node`);
+        }
 
         // Start DHT background announce if enabled in config
-        if (nodeConfig.discovery && nodeConfig.discovery.dht_enabled) {
+        if (effectiveConfig.discovery && effectiveConfig.discovery.dht_enabled) {
           const identityDocument = {
             protocol_version: '1.0.0',
             node_url: nodeUrl,
-            operator_name: nodeConfig.operator_name,
+            operator_name: effectiveConfig.operator_name,
             public_key: keys.publicKey,
             fingerprint: computeFingerprint(keys.publicKey),
             capabilities: ['report-sync', 'peer-discovery', 'incremental-sync'],
@@ -897,22 +1902,44 @@ if (require.main === module) {
             privateKey: keys.privateKey,
             onError: (err) => console.error('DHT announce error:', err.message),
           });
-          console.log(`  DHT: Announcing on ${TOPIC_NAME}`);
+          if (!opts.json) {
+            console.log(`  Discovery:    Announcing on ${TOPIC_NAME}`);
+          }
         }
 
         // Show relay status
-        const relayConfig = nodeConfig.relay;
+        const relayConfig = effectiveConfig.relay;
         if (relayConfig && relayConfig.enabled) {
           const fallbackStr = relayConfig.fallback_only !== false ? '(fallback)' : '(always)';
-          console.log(`  Relay:     ${relayConfig.url} ${fallbackStr}`);
+          if (!opts.json) {
+            const probeStatus = relayProbe ? (relayProbe.ok ? 'reachable' : `unreachable: ${relayProbe.reason}`) : 'unknown';
+            console.log(`  Relay:        ${relayConfig.url} ${fallbackStr} [${probeStatus}]`);
+            if (relayProbe && !relayProbe.ok) {
+              console.log(chalk.yellow('\nRelay fallback could not be reached. Manual fallback instructions:\n'));
+              console.log(manualFallbackInstructions({ port }));
+            }
+          }
         }
 
-        console.log('Press Ctrl+C to stop.');
+        if (!opts.json) {
+          console.log(chalk.gray('Press Ctrl+C to stop.'));
+        }
+
+        if (autoSync.enabled) {
+          autoSyncTimer = setInterval(() => {
+            void runAutoSync('scheduled');
+          }, autoSync.intervalMs);
+          if (typeof autoSyncTimer.unref === 'function') {
+            autoSyncTimer.unref();
+          }
+          setTimeout(() => void runAutoSync('startup'), 1000);
+        }
       });
 
       function shutdown(signal) {
         console.log(`\n${signal} received. Shutting down...`);
         if (dhtAnnouncer) dhtAnnouncer.stop().catch(() => {});
+        if (autoSyncTimer) clearInterval(autoSyncTimer);
         server.close(() => { db.close(); process.exit(0); });
         setTimeout(() => process.exit(1), 5000).unref();
       }
@@ -921,14 +1948,282 @@ if (require.main === module) {
       process.on('SIGINT', () => shutdown('SIGINT'));
     });
 
+  // ── myr invite ───────────────────────────────────────────────────────────────
+  const inviteCmd = program
+    .command('invite')
+    .description('Create and manage MYR onboarding invite links');
+
+  inviteCmd
+    .command('create')
+    .description('Generate a signed invite URL for myr join')
+    .option('--expires-hours <hours>', 'Invite expiration in hours (default: 24)', parseInt, 24)
+    .option('--json', 'Output as JSON')
+    .addHelpText('after', '\nExamples:\n  myr invite create\n  myr invite create --expires-hours 72\n  myr invite create --json')
+    .action((opts) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error(chalk.red('Node not configured. Run: myr setup'));
+        process.exit(1);
+      }
+
+      try {
+        const keys = loadKeypair(nodeConfig);
+        const hours = Number.isFinite(opts.expiresHours) && opts.expiresHours > 0 ? opts.expiresHours : 24;
+        const expiresAt = new Date(Date.now() + (hours * 60 * 60 * 1000)).toISOString();
+        const inviteUrl = makeInviteUrl({
+          nodeConfig,
+          keys,
+          expiresAt,
+          token: nodeCrypto.randomBytes(16).toString('hex'),
+        });
+        const payload = {
+          inviteUrl,
+          expiresAt,
+          operatorName: nodeConfig.operator_name || nodeConfig.node_name || null,
+          fingerprint: computeFingerprint(keys.publicKey),
+          usage: `myr join "${inviteUrl}"`,
+        };
+
+        if (opts.json) {
+          console.log(JSON.stringify(payload, null, 2));
+          return;
+        }
+
+        console.log(chalk.green('Invite created'));
+        console.log(`  URL:         ${inviteUrl}`);
+        console.log(`  Expires:     ${expiresAt}`);
+        console.log(`  Operator:    ${payload.operatorName || 'unknown'}`);
+        console.log(`  Fingerprint: ${payload.fingerprint}`);
+        console.log('');
+        console.log('Usage:');
+        console.log(`  ${payload.usage}`);
+      } catch (err) {
+        console.error(chalk.red(`Invite creation failed: ${err.message}`));
+        process.exit(1);
+      }
+    });
+
+  // ── myr join ────────────────────────────────────────────────────────────────
+  program
+    .command('join <inviteUrl>')
+    .description('Join a peer from an invite URL and establish trust')
+    .option('--json', 'Output as JSON')
+    .option('--no-auto-approve', 'Do not automatically approve joined peer locally')
+    .addHelpText('after', '\nExamples:\n  myr join "myr://invite/<token>"\n  myr join "myr://invite/<token>" --json')
+    .action(async (inviteUrl, opts) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error(chalk.red('Node not configured. Run: myr setup'));
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        const invite = parseInviteUrl(inviteUrl);
+        const keys = loadKeypair(nodeConfig);
+        db = getDbFromNodeConfig(nodeConfig);
+
+        if (!opts.json) {
+          console.log(chalk.yellow('Connecting to invited peer...'));
+        }
+
+        try {
+          await addPeer({
+            db,
+            config: nodeConfig,
+            url: invite.node_url,
+            keys,
+          });
+        } catch (err) {
+          if (!String(err.message).startsWith('Peer already exists:')) {
+            throw err;
+          }
+        }
+
+        const peer = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(invite.public_key);
+        if (!peer) {
+          throw new Error('Joined peer was not persisted in peer store');
+        }
+
+        const discoveredFingerprint = computeFingerprint(peer.public_key);
+        if (invite.fingerprint !== discoveredFingerprint) {
+          rejectPeer({ db, identifier: peer.public_key });
+          throw new Error(`Fingerprint mismatch. Expected ${invite.fingerprint}, got ${discoveredFingerprint}`);
+        }
+
+        const verification = await verifyPeerFingerprint({
+          publicKey: peer.public_key,
+          fingerprint: discoveredFingerprint,
+          peerUrl: peer.peer_url,
+        });
+        if (!verification.verified) {
+          throw new Error(`Peer fingerprint could not be verified: ${verification.reason}`);
+        }
+
+        let stageGranted = peer.trust_level || 'pending';
+        if (opts.autoApprove) {
+          approvePeer({ db, identifier: peer.public_key });
+          stageGranted = 'trusted';
+        }
+
+        const result = {
+          peerName: peer.operator_name || invite.operator_name,
+          peerUrl: peer.peer_url || invite.node_url,
+          fingerprintVerified: true,
+          fingerprint: discoveredFingerprint,
+          trustStageGranted: stageGranted,
+        };
+
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+          return;
+        }
+
+        console.log(chalk.green('Join complete'));
+        console.log(`  Peer:               ${result.peerName}`);
+        console.log(`  Fingerprint:        ${result.fingerprint}`);
+        console.log(`  Fingerprint check:  verified`);
+        console.log(`  Trust stage:        ${result.trustStageGranted}`);
+      } catch (err) {
+        console.error(chalk.red(`Join failed: ${err.message}`));
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
+  // ── myr capture ─────────────────────────────────────────────────────────────
+  program
+    .command('recall')
+    .description('Surface relevant prior yield for a work context')
+    .option('--intent <text>', 'Current work intent')
+    .option('--query <text>', 'Explicit search query')
+    .option('--tags <tags>', 'Comma-separated domain tags')
+    .option('--limit <n>', 'Max results (default 10)', parseInt)
+    .option('--verified-only', 'Only show verified MYRs')
+    .option('--json', 'Output as JSON (for agent/tool consumption)')
+    .addHelpText('after', '\nExamples:\n  myr recall --intent "debug sync timeouts"\n  myr recall --tags "networking" --json')
+    .action((opts) => {
+      const scriptPath = path.join(__dirname, '..', 'scripts', 'myr-recall.js');
+      const args = [];
+      if (opts.intent) args.push('--intent', opts.intent);
+      if (opts.query) args.push('--query', opts.query);
+      if (opts.tags) args.push('--tags', opts.tags);
+      if (Number.isFinite(opts.limit)) args.push('--limit', String(opts.limit));
+      if (opts.verifiedOnly) args.push('--verified-only');
+      if (opts.json) args.push('--json');
+
+      const res = spawnSync(process.execPath, [scriptPath, ...args], {
+        stdio: 'inherit',
+      });
+      if (res.status !== 0) {
+        process.exit(res.status || 1);
+      }
+    });
+
+  // ── myr capture ─────────────────────────────────────────────────────────────
+  program
+    .command('capture')
+    .description('Capture yield: interactive prompts (default) or auto-extract from work logs')
+    .option('--from-log <path>', 'Auto-extract candidate yield from a session log file')
+    .option('--session-intent <text>', 'Session intent hint for auto-extraction mode')
+    .option('--tags <tags>', 'Comma-separated domain tags for auto-extraction mode')
+    .option('--agent <id>', 'Agent identifier for auto-extraction mode')
+    .option('--session-ref <ref>', 'Session reference identifier for auto-extraction mode')
+    .option('--max-yields <n>', 'Max extracted candidates (default 5)', parseInt)
+    .option('--dry-run', 'Auto mode only: show candidates without writing to DB')
+    .option('--json', 'Output capture launcher metadata as JSON')
+    .addHelpText('after', '\nExamples:\n  myr capture\n  myr capture --from-log ./session.log --tags "sync,networking"\n  cat session.log | myr capture --session-intent "debug sync" --json')
+    .action((opts) => {
+      const useAutoMode = !!opts.fromLog || !process.stdin.isTTY;
+      if (!useAutoMode && opts.json) {
+        console.log(JSON.stringify({
+          command: 'capture',
+          mode: 'interactive',
+          delegatedTo: 'scripts/myr-store.js --interactive',
+        }, null, 2));
+        return;
+      }
+
+      const scriptPath = useAutoMode
+        ? path.join(__dirname, '..', 'scripts', 'myr-capture.js')
+        : path.join(__dirname, '..', 'scripts', 'myr-store.js');
+
+      const args = [];
+      if (useAutoMode) {
+        if (opts.fromLog) args.push('--file', opts.fromLog);
+        if (opts.sessionIntent) args.push('--session-intent', opts.sessionIntent);
+        if (opts.tags) args.push('--tags', opts.tags);
+        if (opts.agent) args.push('--agent', opts.agent);
+        if (opts.sessionRef) args.push('--session-ref', opts.sessionRef);
+        if (Number.isFinite(opts.maxYields)) args.push('--max-yields', String(opts.maxYields));
+        if (opts.dryRun) args.push('--dry-run');
+        if (opts.json) args.push('--json');
+      } else {
+        args.push('--interactive');
+      }
+
+      const res = spawnSync(process.execPath, [scriptPath, ...args], {
+        stdio: 'inherit',
+      });
+      if (res.status !== 0) {
+        process.exit(res.status || 1);
+      }
+    });
+
   // ── myr status ──────────────────────────────────────────────────────────────
   program
-    .command('status')
-    .description('Show node identity, active peers, and last sync times')
-    .action(() => {
+    .command('contradictions')
+    .description('Detect and list contradictory yields')
+    .option('--domain <tag>', 'Filter detection and output to a single domain tag')
+    .option('--json', 'Output JSON')
+    .action((opts) => {
       const nodeConfig = loadNodeConfig();
       if (!nodeConfig) {
         console.error('Node not configured. Run: myr setup');
+        process.exit(1);
+      }
+
+      let db;
+      try {
+        db = getDbFromNodeConfig(nodeConfig);
+        const result = listContradictions({ db, domain: opts.domain || null });
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+          return;
+        }
+
+        console.log(`Scanned reports: ${result.scannedReports}`);
+        console.log(`Detected/updated contradiction records: ${result.detectedCount}`);
+        if (result.contradictions.length === 0) {
+          console.log('No contradictions found.');
+          return;
+        }
+
+        for (const row of result.contradictions) {
+          const domain = row.domain_tag || 'n/a';
+          console.log(
+            `${row.contradiction_type} | ${row.yield_a_id} <-> ${row.yield_b_id} | domain=${domain}`
+          );
+        }
+      } catch (err) {
+        console.error(err.message);
+        process.exit(1);
+      } finally {
+        if (db) db.close();
+      }
+    });
+
+  // ── myr status ──────────────────────────────────────────────────────────────
+  program
+    .command('status')
+    .description('Show node identity, participation progress, active peers, and last sync times')
+    .option('--json', 'Output as JSON')
+    .addHelpText('after', '\nExamples:\n  myr status\n  myr status --json')
+    .action((opts) => {
+      const nodeConfig = loadNodeConfig();
+      if (!nodeConfig) {
+        console.error(chalk.red('Node not configured. Run: myr setup'));
         process.exit(1);
       }
 
@@ -941,20 +2236,88 @@ if (require.main === module) {
         const peers = listPeers({ db });
         const trustedPeers = peers.filter(p => p.trust_level === 'trusted');
         const pendingPeers = peers.filter(p => p.trust_level === 'pending');
+        const totalMyrs = db.prepare('SELECT COUNT(*) AS c FROM myr_reports').get().c;
+        const syncSummary = db.prepare(`
+          SELECT
+            MAX(last_sync_at) AS last_sync_at,
+            SUM(CASE WHEN trust_level = 'trusted' AND last_sync_at IS NOT NULL THEN 1 ELSE 0 END) AS synced_trusted_peers
+          FROM myr_peers
+        `).get();
+        const participationStats = gatherPeerStats(db, keys.publicKey);
+        const participation = getStageProgress(
+          nodeConfig.participation_stage || 'provisional',
+          participationStats
+        );
+        const autoSync = getAutoSyncSettings(nodeConfig);
+        const statusPayload = {
+          nodeId: getNodeIdentifier(nodeConfig, keys),
+          operatorName: nodeConfig.operator_name || nodeConfig.node_name || null,
+          fingerprint: fp,
+          url: nodeConfig.node_url || null,
+          port: nodeConfig.port || 3719,
+          participationStage: participation.current.key,
+          participation,
+          peerCount: peers.length,
+          trustedPeerCount: trustedPeers.length,
+          pendingPeerCount: pendingPeers.length,
+          syncStatus: trustedPeers.length > 0
+            ? `${syncSummary.synced_trusted_peers || 0}/${trustedPeers.length} trusted peers synced`
+            : 'no trusted peers',
+          lastSyncTime: syncSummary.last_sync_at || null,
+          myrCount: totalMyrs,
+          reachabilityMethod: nodeConfig.relay && nodeConfig.relay.enabled
+            ? 'relay'
+            : (nodeConfig.node_url && !nodeConfig.node_url.includes('localhost') ? 'direct-public' : 'local-only'),
+          relay: nodeConfig.relay && nodeConfig.relay.enabled
+            ? { url: nodeConfig.relay.url, fallbackOnly: nodeConfig.relay.fallback_only !== false }
+            : null,
+          autoSync: {
+            enabled: autoSync.enabled,
+            interval: autoSync.intervalLabel,
+            minInterval: autoSync.minIntervalLabel,
+          },
+        };
 
-        console.log('\nNode Identity:');
-        console.log(`  Operator:    ${nodeConfig.operator_name}`);
-        console.log(`  Fingerprint: ${fp}`);
-        console.log(`  URL:         ${nodeConfig.node_url || '(not set)'}`);
-        console.log(`  Port:        ${nodeConfig.port || 3719}`);
+        if (opts.json) {
+          console.log(JSON.stringify(statusPayload, null, 2));
+          return;
+        }
+
+        console.log(chalk.bold('\nNode Identity:'));
+        console.log(`  Node ID:      ${statusPayload.nodeId}`);
+        console.log(`  Operator:     ${statusPayload.operatorName || 'unknown'}`);
+        console.log(`  Fingerprint:  ${statusPayload.fingerprint}`);
+        console.log(`  URL:          ${statusPayload.url || '(not set)'}`);
+        console.log(`  Port:         ${statusPayload.port}`);
+        console.log(`  Reachability: ${statusPayload.reachabilityMethod}`);
+        console.log(`  Auto-sync:    ${statusPayload.autoSync.enabled ? `enabled (${statusPayload.autoSync.interval})` : 'disabled'}`);
+        console.log(`  MYRs:         ${statusPayload.myrCount}`);
+        console.log(`  Sync:         ${statusPayload.syncStatus}`);
+        console.log(`  Last sync:    ${statusPayload.lastSyncTime || 'never'}`);
 
         const relayConfig = nodeConfig.relay;
         if (relayConfig && relayConfig.enabled) {
           const fallbackStr = relayConfig.fallback_only !== false ? 'fallback enabled' : 'always active';
-          console.log(`  Relay:       ${relayConfig.url} (${fallbackStr})`);
+          console.log(`  Relay:        ${relayConfig.url} (${fallbackStr})`);
         }
 
-        console.log('\nPeers:');
+        console.log(chalk.bold('\nParticipation:'));
+        console.log(`  Current:      ${statusPayload.participation.current.label} (${statusPayload.participation.current.key})`);
+        console.log(`  Baseline:     ${statusPayload.participation.minimumViable.met ? 'met' : 'not yet'} — ${statusPayload.participation.minimumViable.description}`);
+        if (statusPayload.participation.nextStage) {
+          console.log(`  Next stage:   ${statusPayload.participation.nextStage.label} (${statusPayload.participation.nextStage.key})`);
+          console.log(`  Progress:     ${statusPayload.participation.progress.metChecks}/${statusPayload.participation.progress.totalChecks} checks (${statusPayload.participation.progress.percent}%)`);
+        } else {
+          console.log('  Next stage:   none (already at maximum stage)');
+        }
+        if (statusPayload.participation.guidance.length > 0) {
+          console.log('\nNext steps:');
+          for (const line of statusPayload.participation.guidance) {
+            console.log(`  - ${line}`);
+          }
+        }
+
+        console.log(chalk.bold('\nPeers:'));
         console.log(`  Trusted: ${trustedPeers.length}`);
         console.log(`  Pending: ${pendingPeers.length}`);
         console.log(`  Total:   ${peers.length}`);
@@ -992,6 +2355,9 @@ module.exports = {
   addPeer,
   approvePeer,
   rejectPeer,
+  revokePeerGovernance,
+  quarantineYield,
+  governanceAudit,
   listPeers,
   getFingerprint,
   getPeerFingerprint,
@@ -999,9 +2365,20 @@ module.exports = {
   nodeVerify,
   announceTo,
   verifyPeer,
+  inferTargetDomains,
+  routePeersForSync,
+  syncTrustedPeers,
+  listContradictions,
+  publishSubscription,
+  propagateSubscriptionSignal,
   makeSignedHeaders,
+  makeInviteUrl,
+  parseInviteUrl,
+  inviteSigningMessage,
   httpFetch,
   loadKeypair,
   loadPublicKeyHex,
   loadPrivateKeyHex,
+  parseDurationMs,
+  getAutoSyncSettings,
 };

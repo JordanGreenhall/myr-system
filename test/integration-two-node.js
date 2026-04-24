@@ -149,6 +149,8 @@ async function main() {
 
   const keysA = generateKeypair();
   const keysB = generateKeypair();
+  const keysC = generateKeypair();
+  const keysD = generateKeypair();
   const keysUnknown = generateKeypair();
 
   const dbA = makeDb();
@@ -251,7 +253,7 @@ async function main() {
     // ══════════════════════════════════════════════════════════════════════════
     // PHASE 2: Peer Discovery via Introduce + Approve
     // ══════════════════════════════════════════════════════════════════════════
-    console.log('\nPhase 2: Peer Discovery & Mutual Approval\n');
+    console.log('\nPhase 2: Peer Discovery & Automatic Trust\n');
 
     // Use the introduce endpoint (public, no registry requirement)
     await test('POST /myr/peer/introduce: B introduces to A', async () => {
@@ -272,29 +274,105 @@ async function main() {
         }),
       });
       assert.equal(r.status, 200);
-      assert.equal(r.body.status, 'introduced');
+      assert.equal(r.body.status, 'connected');
     });
 
-    await test('After introduce: A has B as introduced peer', async () => {
+    await test('After introduce: A has B as trusted peer', async () => {
       const peer = dbA.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(keysB.publicKey);
       assert.ok(peer, 'peer not found in DB');
-      // The introduce endpoint stores peers as 'introduced' (not yet trusted)
-      assert.equal(peer.trust_level, 'introduced');
+      assert.equal(peer.trust_level, 'trusted');
       assert.equal(peer.operator_name, 'node-b');
     });
 
-    await test('B cannot fetch A reports while pending', async () => {
-      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB });
-      assert.equal(r.status, 403);
+    await test('Trusted peer can vouch for a new node with signed introduction', async () => {
+      dbA.prepare(
+        `INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, approved_at)
+         VALUES (?, ?, ?, 'trusted', datetime('now'), datetime('now'))`
+      ).run('http://127.0.0.1:37999', 'node-c', keysC.publicKey);
+
+      const introduceBody = {
+        identity_document: {
+          protocol_version: '1.0.0',
+          public_key: keysD.publicKey,
+          fingerprint: computeFingerprint(keysD.publicKey),
+          operator_name: 'node-d',
+          node_url: 'http://127.0.0.1:37998',
+          capabilities: ['report-sync'],
+          created_at: new Date().toISOString(),
+        },
+        introduction_message: 'Vouched by node-c',
+      };
+
+      const headers = makeSignedHeaders({
+        method: 'POST',
+        urlPath: '/myr/peer/introduce',
+        body: introduceBody,
+        privateKey: keysC.privateKey,
+        publicKey: keysC.publicKey,
+      });
+      headers['content-type'] = 'application/json';
+
+      const r = await rawFetch(`${urlA}/myr/peer/introduce`, {
+        method: 'POST',
+        headers,
+        body: introduceBody,
+      });
+
+      assert.equal(r.status, 200);
+      assert.equal(r.body.vouch.status, 'accepted');
+      assert.equal(r.body.vouch.voucher_public_key, keysC.publicKey);
+
+      const peer = dbA.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(keysD.publicKey);
+      assert.ok(peer, 'vouched node not stored');
+      assert.equal(peer.trust_level, 'trusted');
+      const notes = JSON.parse(peer.notes);
+      assert.equal(notes.introduced_by, keysC.publicKey);
     });
 
-    await test('A approves B → trust_level becomes trusted', async () => {
-      dbA.prepare(
-        `UPDATE myr_peers SET trust_level='trusted', approved_at=datetime('now')
-         WHERE public_key=?`
-      ).run(keysB.publicKey);
-      const peer = dbA.prepare('SELECT trust_level FROM myr_peers WHERE public_key=?').get(keysB.publicKey);
+    await test('Invalid signed introduction is rejected', async () => {
+      const keysBad = generateKeypair();
+      const introduceBody = {
+        identity_document: {
+          protocol_version: '1.0.0',
+          public_key: keysBad.publicKey,
+          fingerprint: computeFingerprint(keysBad.publicKey),
+          operator_name: 'bad-node',
+          node_url: 'http://127.0.0.1:37997',
+          capabilities: ['report-sync'],
+          created_at: new Date().toISOString(),
+        },
+      };
+
+      const forgedHeaders = makeSignedHeaders({
+        method: 'POST',
+        urlPath: '/myr/peer/introduce',
+        body: introduceBody,
+        privateKey: keysUnknown.privateKey,
+        publicKey: keysC.publicKey,
+      });
+      forgedHeaders['content-type'] = 'application/json';
+
+      const r = await rawFetch(`${urlA}/myr/peer/introduce`, {
+        method: 'POST',
+        headers: forgedHeaders,
+        body: introduceBody,
+      });
+
+      assert.equal(r.status, 400);
+      assert.equal(r.body.error.code, 'invalid_signature');
+    });
+
+    await test('B can fetch A reports after automatic trust', async () => {
+      const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB });
+      assert.equal(r.status, 200);
+      assert.ok(Array.isArray(r.body.reports));
+    });
+
+    await test('A marks B trusted without manual approve step', async () => {
+      const peer = dbA.prepare('SELECT trust_level, approved_at FROM myr_peers WHERE public_key=?')
+        .get(keysB.publicKey);
       assert.equal(peer.trust_level, 'trusted');
+      assert.ok(peer.approved_at, 'approved_at should be set for automatic trust');
     });
 
     // A introduces to B (mutual)
@@ -317,16 +395,14 @@ async function main() {
       assert.equal(r.status, 200);
     });
 
-    await test('B approves A → trust_level trusted', async () => {
-      dbB.prepare(
-        `UPDATE myr_peers SET trust_level='trusted', approved_at=datetime('now')
-         WHERE public_key=?`
-      ).run(keysA.publicKey);
-      const peer = dbB.prepare('SELECT trust_level FROM myr_peers WHERE public_key=?').get(keysA.publicKey);
+    await test('B marks A trusted without manual approve step', async () => {
+      const peer = dbB.prepare('SELECT trust_level, approved_at FROM myr_peers WHERE public_key=?')
+        .get(keysA.publicKey);
       assert.equal(peer.trust_level, 'trusted');
+      assert.ok(peer.approved_at, 'approved_at should be set for automatic trust');
     });
 
-    await test('After mutual approval: B can fetch A reports (200)', async () => {
+    await test('After trust establishment: B can fetch A reports (200)', async () => {
       const r = await signedFetch(`${urlA}/myr/reports`, { keys: keysB });
       assert.equal(r.status, 200);
       assert.ok(Array.isArray(r.body.reports));

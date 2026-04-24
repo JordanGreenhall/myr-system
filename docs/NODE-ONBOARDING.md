@@ -1,7 +1,7 @@
 # MYR Network — Node Onboarding Guide
 
-**Version:** 1.0  
-**Date:** 2026-02-27  
+**Version:** 1.1  
+**Date:** 2026-04-17  
 **For:** Incoming Node operators (Node 1, Node 2)
 
 ---
@@ -37,9 +37,9 @@ Every MYR includes: what was attempted, what evidence supports the finding, what
 There are two things you're responsible for:
 
 **1. Producing real yield.**
-Run the MYR capture tool after significant work sessions. Rate your own reports honestly. The network only shares Jordan-verified artifacts (rating ≥ 3/5) — so build up a verified corpus before your first export.
+Run the MYR capture tool after significant work sessions. Rate your own reports honestly. The network only shares verified artifacts (rating >= 3/5).
 
-**Joining gate:** ≥10 MYRs with average rating ≥ 3.0 before you participate in cross-node exchange.
+**First-value gate:** >=1 verified MYR before your first cross-node exchange.
 
 **2. Closing the loop.**
 When you receive yield from another node, you respond. No silent imports. A two-sentence reply is sufficient. If you apply something, say so. If nothing was applicable this week, say that too.
@@ -115,21 +115,17 @@ Respond within one week of import.
 
 ---
 
-## Bootstrap: Your First Exchange
+## Bootstrap: Invite-Link Join
 
-Before you join the regular weekly cycle, you and your direct peer run a one-time bootstrap:
+Before the weekly cycle, run a one-time invite-link bootstrap:
 
-1. **Exchange identity documents out-of-band** — share public keys via a verified channel (in-person, Signal, video call). Each side confirms: fingerprint matches public key.
+1. Existing node runs `myr invite create` and shares the `myr://invite/...` URL.
+2. New node runs `myr join "<invite-url>"`.
+3. Join flow auto-introduces, verifies the fingerprint, and validates invite signature integrity.
+4. Both nodes exchange one verified MYR and acknowledge receipt.
+5. Each side applies one received MYR and reports outcome in the shared thread.
 
-2. **Key confirmation** — each side signs a short nonce challenge from the other and returns it. Verify before proceeding.
-
-3. **Genesis share** — each node exports and shares one verified MYR. This is your first real exchange.
-
-4. **Acknowledge** — each side confirms receipt and reads the artifact.
-
-5. **Apply** — each side applies one received MYR in real work and reports the outcome in the shared thread.
-
-Bootstrap complete. You're now at coupling level: **Coordinate**. The regular weekly cycle begins.
+Bootstrap complete. You're now at coupling level: **Coordinate**.
 
 ---
 
@@ -174,11 +170,12 @@ The system has no enforcement mechanism beyond visibility. A node that performs 
 1. Install the MYR system: `git clone {repo} && npm install && cp config.example.json config.json`
 2. Configure your node ID in `config.json`
 3. Generate your keypair: `node scripts/myr-keygen.js`
-4. Share your public key with your peer node(s) out-of-band
-5. Start capturing yield: `node scripts/myr-store.js --interactive`
-6. Build to ≥10 verified MYRs
-7. Run the bootstrap ceremony with your first peer
+4. Start capturing yield: `node scripts/myr-store.js --interactive`
+5. Build your first verified MYR
+6. Exchange an invite link (`myr invite create` / `myr join "<invite-url>"`)
+7. Run first exchange + acknowledgement
 8. Join the weekly cycle
+9. Before publish/release, run: `npm run test:release` (includes onboarding acceptance truth gate)
 
 Questions on setup: consult the README. Questions on the protocol: contact Jordan.
 

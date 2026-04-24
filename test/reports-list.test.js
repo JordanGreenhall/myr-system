@@ -166,6 +166,18 @@ describe('GET /myr/reports', () => {
     }
   });
 
+  it('supports replay range via from/until', async () => {
+    const { status, body } = await authedRequest(port, {
+      path: '/myr/reports?from=2026-03-01T10:00:00Z&until=2026-03-01T11:00:00Z',
+      keys: trustedKeys,
+    });
+    assert.equal(status, 200);
+    assert.equal(body.reports.length, 1);
+    assert.equal(body.reports[0].created_at, '2026-03-01T11:00:00Z');
+    assert.equal(body.from, '2026-03-01T10:00:00Z');
+    assert.equal(body.until, '2026-03-01T11:00:00Z');
+  });
+
   it('limit parameter caps result count', async () => {
     const { status, body } = await authedRequest(port, {
       path: '/myr/reports?limit=2',
@@ -185,17 +197,18 @@ describe('GET /myr/reports', () => {
     assert.ok(body.reports.length <= 500);
   });
 
-  it('orders results by created_at ASC', async () => {
+  it('orders results by yield_score DESC (trust-weighted)', async () => {
     const { body } = await authedRequest(port, {
       path: '/myr/reports',
       keys: trustedKeys,
     });
     for (let i = 1; i < body.reports.length; i++) {
       assert.ok(
-        body.reports[i].created_at >= body.reports[i - 1].created_at,
-        'results must be ordered by created_at ASC',
+        body.reports[i].yield_score <= body.reports[i - 1].yield_score,
+        'results must be ordered by yield_score DESC',
       );
     }
+    assert.strictEqual(body.trust_weighted, true);
   });
 
   // --- Response structure ---
@@ -209,6 +222,8 @@ describe('GET /myr/reports', () => {
     assert.ok('reports' in body);
     assert.ok('total' in body);
     assert.ok('since' in body);
+    assert.ok('from' in body);
+    assert.ok('until' in body);
 
     const report = body.reports[0];
     const required = [
@@ -285,6 +300,24 @@ describe('GET /myr/reports', () => {
   it('returns 400 for limit < 1', async () => {
     const { status, body } = await authedRequest(port, {
       path: '/myr/reports?limit=0',
+      keys: trustedKeys,
+    });
+    assert.equal(status, 400);
+    assert.equal(body.error.code, 'invalid_request');
+  });
+
+  it('returns 400 for invalid until parameter', async () => {
+    const { status, body } = await authedRequest(port, {
+      path: '/myr/reports?until=nope',
+      keys: trustedKeys,
+    });
+    assert.equal(status, 400);
+    assert.equal(body.error.code, 'invalid_request');
+  });
+
+  it('returns 400 when until <= from', async () => {
+    const { status, body } = await authedRequest(port, {
+      path: '/myr/reports?from=2026-03-01T11:00:00Z&until=2026-03-01T11:00:00Z',
       keys: trustedKeys,
     });
     assert.equal(status, 400);

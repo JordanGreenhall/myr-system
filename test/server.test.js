@@ -21,6 +21,32 @@ function get(port, path) {
   });
 }
 
+function post(port, path, payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const req = http.request(
+      `http://localhost:${port}${path}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        let responseBody = '';
+        res.on('data', (chunk) => (responseBody += chunk));
+        res.on('end', () => {
+          resolve({ status: res.statusCode, body: JSON.parse(responseBody) });
+        });
+      }
+    );
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
+}
+
 function createTestDb() {
   const db = new Database(':memory:');
   db.pragma('journal_mode = WAL');
@@ -57,6 +83,29 @@ function createTestDb() {
       auto_sync INTEGER DEFAULT 1,
       notes TEXT
     );
+
+    CREATE TABLE myr_traces (
+      trace_id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      actor_fingerprint TEXT NOT NULL,
+      target_fingerprint TEXT,
+      artifact_signature TEXT,
+      outcome TEXT NOT NULL,
+      rejection_reason TEXT,
+      metadata TEXT DEFAULT '{}'
+    );
+
+    CREATE TABLE myr_syntheses (
+      id TEXT PRIMARY KEY,
+      timestamp TEXT NOT NULL,
+      source_myr_ids TEXT NOT NULL,
+      node_ids TEXT NOT NULL,
+      domain_tags TEXT NOT NULL,
+      synthesis_text TEXT NOT NULL,
+      signed_by TEXT,
+      created_at TEXT NOT NULL
+    );
   `);
 
   return db;
@@ -91,6 +140,15 @@ function seedTestData(db) {
     'pending', '2026-03-01T08:00:00Z', null);
   insertPeer.run('https://eve.myr.network', 'eve', 'cc'.repeat(32),
     'trusted', '2026-02-27T08:00:00Z', '2026-03-01T09:00:00Z');
+
+  const insertTrace = db.prepare(`
+    INSERT INTO myr_traces (trace_id, timestamp, event_type, actor_fingerprint, target_fingerprint, artifact_signature, outcome, rejection_reason, metadata)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  insertTrace.run('t1', '2026-03-01T10:05:00Z', 'sync_pull', 'a', 'b', 'sig1', 'success', null, '{}');
+  insertTrace.run('t2', '2026-03-01T10:15:00Z', 'sync_pull', 'a', 'b', 'sig2', 'success', null, '{}');
+  insertTrace.run('t3', '2026-03-01T10:20:00Z', 'sync_push', 'a', 'b', 'sig3', 'failure', 'network_error', '{}');
 }
 
 const TEST_CONFIG = {
@@ -303,6 +361,112 @@ describe('GET /myr/health (empty database)', () => {
   });
 });
 
+describe('GET /myr/health/node', () => {
+  let server, port, db;
+
+  before(() => {
+    db = createTestDb();
+    seedTestData(db);
+    const app = createApp({
+      config: TEST_CONFIG,
+      db,
+      publicKeyHex: TEST_PUBLIC_KEY,
+      createdAt: TEST_CREATED_AT,
+    });
+    server = app.listen(0);
+    port = server.address().port;
+  });
+
+  after(() => {
+    server.close();
+    db.close();
+  });
+
+  it('returns aggregated node metrics and status', async () => {
+    const { status, body } = await get(port, '/myr/health/node');
+    assert.equal(status, 200);
+    assert.ok(['green', 'yellow', 'red'].includes(body.status));
+    assert.equal(typeof body.metrics.uptime_seconds, 'number');
+    assert.equal(typeof body.metrics.sync_count, 'number');
+    assert.equal(typeof body.metrics.yield_count, 'number');
+    assert.equal(typeof body.metrics.peer_count, 'number');
+    assert.equal(typeof body.metrics.peer_count_trusted, 'number');
+    assert.ok('queue_age_seconds' in body.metrics);
+  });
+});
+
+describe('GET /myr/health/network', () => {
+  let server, port, db;
+
+  before(() => {
+    db = createTestDb();
+    seedTestData(db);
+    const app = createApp({
+      config: TEST_CONFIG,
+      db,
+      publicKeyHex: TEST_PUBLIC_KEY,
+      createdAt: TEST_CREATED_AT,
+    });
+    server = app.listen(0);
+    port = server.address().port;
+  });
+
+  after(() => {
+    server.close();
+    db.close();
+  });
+
+  it('returns network reachability and freshness aggregates', async () => {
+    const { status, body } = await get(port, '/myr/health/network');
+    assert.equal(status, 200);
+    assert.ok(['green', 'yellow', 'red'].includes(body.status));
+    assert.equal(typeof body.metrics.known_peers, 'number');
+    assert.equal(typeof body.metrics.reachable_peers, 'number');
+    assert.equal(typeof body.metrics.stale_peers, 'number');
+    assert.equal(typeof body.metrics.reachability_ratio, 'number');
+    assert.ok(
+      body.metrics.sync_freshness_seconds === null ||
+      typeof body.metrics.sync_freshness_seconds === 'number'
+    );
+  });
+});
+
+describe('GET /myr/health/flow', () => {
+  let server, port, db;
+
+  before(() => {
+    db = createTestDb();
+    seedTestData(db);
+    const app = createApp({
+      config: TEST_CONFIG,
+      db,
+      publicKeyHex: TEST_PUBLIC_KEY,
+      createdAt: TEST_CREATED_AT,
+    });
+    server = app.listen(0);
+    port = server.address().port;
+  });
+
+  after(() => {
+    server.close();
+    db.close();
+  });
+
+  it('returns flow metrics from reports + traces', async () => {
+    const { status, body } = await get(port, '/myr/health/flow');
+    assert.equal(status, 200);
+    assert.ok(['green', 'yellow', 'red'].includes(body.status));
+    assert.equal(typeof body.metrics.ingestion_rate_per_hour, 'number');
+    assert.ok(
+      body.metrics.sync_latency_seconds === null ||
+      typeof body.metrics.sync_latency_seconds === 'number'
+    );
+    assert.equal(typeof body.metrics.retrieval_effectiveness, 'number');
+    assert.equal(typeof body.metrics.successful_sync_events, 'number');
+    assert.equal(typeof body.metrics.failed_sync_events, 'number');
+  });
+});
+
 describe('Server lifecycle', () => {
   it('starts on a configured port', async () => {
     const db = createTestDb();
@@ -353,5 +517,68 @@ describe('Server lifecycle', () => {
     );
 
     db.close();
+  });
+});
+
+describe('POST /myr/synthesis', () => {
+  let server, port, db;
+
+  before(() => {
+    db = createTestDb();
+    seedTestData(db);
+    const app = createApp({
+      config: TEST_CONFIG,
+      db,
+      publicKeyHex: TEST_PUBLIC_KEY,
+      createdAt: TEST_CREATED_AT,
+    });
+    server = app.listen(0);
+    port = server.address().port;
+  });
+
+  after(() => {
+    server.close();
+    db.close();
+  });
+
+  it('returns 400 for invalid payload', async () => {
+    const { status, body } = await post(port, '/myr/synthesis', {});
+    assert.equal(status, 400);
+    assert.equal(body.error.code, 'invalid_request');
+  });
+
+  it('validates, synthesizes, and stores result', async () => {
+    const now = '2026-03-02T10:00:00Z';
+    const insertReport = db.prepare(`
+      INSERT INTO myr_reports (
+        id, timestamp, agent_id, node_id, cycle_intent, domain_tags,
+        yield_type, question_answered, evidence, what_changes_next, confidence,
+        created_at, updated_at, share_network
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insertReport.run(
+      'sx-1', now, 'agent1', 'n1', 'synthesis test', '["testing"]', 'insight',
+      'What improved reliability?', 'retry backoff helped', 'apply retry', 0.9, now, now, 1
+    );
+    insertReport.run(
+      'sx-2', now, 'agent2', 'n2', 'synthesis test', '["testing"]', 'insight',
+      'What improved reliability?', 'circuit breaker helped', 'apply retry', 0.8, now, now, 1
+    );
+
+    const { status, body } = await post(port, '/myr/synthesis', {
+      tags: 'testing',
+      minNodes: 2,
+      store: true,
+    });
+
+    assert.equal(status, 200);
+    assert.ok(body.synthesis_id);
+    assert.equal(body.stored, true);
+    assert.ok(body.source_count >= 2);
+    assert.ok(body.cluster_count >= 1);
+
+    const stored = db.prepare('SELECT * FROM myr_syntheses WHERE id = ?').get(body.synthesis_id);
+    assert.ok(stored);
+    assert.equal(JSON.parse(stored.domain_tags)[0], 'testing');
   });
 });
