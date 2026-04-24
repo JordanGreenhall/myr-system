@@ -1,7 +1,7 @@
 # MYR Risk Register
 
 **Date:** 2026-04-24
-**Version:** v1.3.1
+**Version:** v1.3.4
 **Current cohort:** C0 (3 nodes)
 
 ---

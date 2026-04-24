@@ -1,7 +1,7 @@
 # MYR Readiness Decision Packet
 
 **Date:** 2026-04-24
-**Version:** v1.3.3
+**Version:** v1.3.4
 **Current cohort:** C0 (3 nodes)
 **Assessment:** CONDITIONAL GO for C1 expansion
 
@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-MYR is a distributed methodological intelligence network targeting 10,000+ participants. The system is currently operational at C0 (3 nodes) with v1.3.3 released and verified.
+MYR is a distributed methodological intelligence network targeting 10,000+ participants. The system is currently operational at C0 (3 nodes) with v1.3.4 released and verified.
 
 ### Quantitative Position
 

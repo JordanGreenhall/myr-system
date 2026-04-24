@@ -1,7 +1,7 @@
 # Next Cohort Objective: C1 (10 Nodes)
 
 **Date:** 2026-04-24
-**Current state:** C0 (3 nodes), v1.3.3 released
+**Current state:** C0 (3 nodes), v1.3.4 released
 **Target:** C1 — expand from 3 to 10 nodes
 
 ---
