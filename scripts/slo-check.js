@@ -85,6 +85,9 @@ function evaluateSlo({ metrics, healthStatus, fanout }) {
   const syncLag = metrics?.sync?.sync_lag_seconds;
   const activeView = metrics?.gossip?.active_view_size;
   const fMinusOne = Math.max((Number.isFinite(fanout) ? fanout : 5) - 1, 0);
+  const governanceP99 = metrics?.slo_governance_propagation_p99_seconds ?? metrics?.slo?.governance_propagation_p99_seconds;
+  const onboardingCompliancePct = metrics?.onboarding?.compliant_pct;
+  const uptimePct = metrics?.slo_uptime_pct ?? metrics?.slo?.uptime_pct;
 
   const results = [
     {
@@ -109,27 +112,35 @@ function evaluateSlo({ metrics, healthStatus, fanout }) {
     },
     {
       id: 'governance_propagation',
-      target: '99% revocations propagate within Z seconds',
-      metric: 'governance.* (not currently in /myr/metrics)',
-      observed: null,
-      status: 'not_evaluable',
-      reason: 'Required governance propagation metrics are not exposed by /myr/metrics',
+      target: '99th percentile revocation propagation <= 120s',
+      metric: 'slo_governance_propagation_p99_seconds',
+      observed: governanceP99,
+      status: Number.isFinite(governanceP99) ? (governanceP99 <= 120 ? 'pass' : 'fail') : 'not_evaluable',
+      reason: Number.isFinite(governanceP99)
+        ? `Observed p99=${governanceP99}s`
+        : 'No governance propagation sample yet',
     },
     {
       id: 'onboarding_success',
       target: '>=95% myr join attempts succeed within 60s',
-      metric: 'onboarding.* (not currently in /myr/metrics)',
-      observed: null,
-      status: 'not_evaluable',
-      reason: 'Required onboarding attempt/success metrics are not exposed by /myr/metrics',
+      metric: 'onboarding.compliant_pct',
+      observed: onboardingCompliancePct,
+      status: Number.isFinite(onboardingCompliancePct) ? (onboardingCompliancePct >= 95 ? 'pass' : 'fail') : 'not_evaluable',
+      reason: Number.isFinite(onboardingCompliancePct)
+        ? `Observed compliant_pct=${onboardingCompliancePct}%`
+        : 'No onboarding attempts recorded yet',
     },
     {
       id: 'uptime',
       target: '/myr/health returns 200 for >=99.5% checks',
-      metric: 'HTTP status from /myr/health',
-      observed: healthStatus,
-      status: healthStatus === 200 ? 'pass' : 'fail',
-      reason: `Current /myr/health status=${healthStatus}`,
+      metric: 'slo_uptime_pct + /myr/health status',
+      observed: uptimePct ?? healthStatus,
+      status: Number.isFinite(uptimePct)
+        ? (uptimePct >= 99.5 && healthStatus === 200 ? 'pass' : 'fail')
+        : (healthStatus === 200 ? 'pass' : 'fail'),
+      reason: Number.isFinite(uptimePct)
+        ? `Current uptime=${uptimePct}%, /myr/health status=${healthStatus}`
+        : `Current /myr/health status=${healthStatus}`,
     },
   ];
 

@@ -224,6 +224,15 @@ describe('GET /myr/metrics', () => {
     assert.equal(typeof body.gossip.ihave_received, 'number');
     assert.equal(typeof body.gossip.iwant_sent, 'number');
     assert.equal(typeof body.gossip.iwant_received, 'number');
+    assert.ok(body.slo);
+    assert.ok(body.onboarding);
+    assert.ok(body.governance);
+    assert.ok('slo_sync_freshness_compliant_pct' in body);
+    assert.ok('slo_gossip_health_compliant_pct' in body);
+    assert.ok('slo_governance_propagation_p99_seconds' in body);
+    assert.ok('slo_onboarding_success_p95_seconds' in body);
+    assert.ok('slo_uptime_pct' in body);
+    assert.equal(typeof body.slo_uptime_pct, 'number');
   });
 
   it('rejects unknown authenticated peers', async () => {

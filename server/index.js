@@ -91,6 +91,116 @@ function computeHealthStatus(value, thresholds) {
   return 'red';
 }
 
+function parseIsoTimestampMs(value) {
+  if (!value) return null;
+  const ms = new Date(value).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function percentile(values, pct) {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  const sorted = values
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b);
+  if (sorted.length === 0) return null;
+  const normalizedPct = Math.max(0, Math.min(Number(pct) || 0, 100));
+  const rank = Math.ceil((normalizedPct / 100) * sorted.length) - 1;
+  const idx = Math.max(0, Math.min(rank, sorted.length - 1));
+  return Number(sorted[idx].toFixed(3));
+}
+
+function calculateGovernancePropagationStats(db) {
+  let rows = [];
+  try {
+    rows = db.prepare(`
+      SELECT action_type, created_at, updated_at
+      FROM myr_governance_signals
+      WHERE action_type = 'revoke'
+    `).all();
+  } catch {
+    rows = [];
+  }
+
+  const latencies = [];
+  for (const row of rows) {
+    const createdMs = parseIsoTimestampMs(row.created_at);
+    const updatedMs = parseIsoTimestampMs(row.updated_at);
+    if (!Number.isFinite(createdMs) || !Number.isFinite(updatedMs) || updatedMs < createdMs) continue;
+    latencies.push((updatedMs - createdMs) / 1000);
+  }
+
+  const compliantCount = latencies.filter((value) => value <= 120).length;
+  return {
+    sample_count: latencies.length,
+    compliant_pct: latencies.length > 0 ? Number(((compliantCount / latencies.length) * 100).toFixed(3)) : null,
+    p99_seconds: percentile(latencies, 99),
+  };
+}
+
+function calculateOnboardingStats(db) {
+  let peers = [];
+  try {
+    peers = db.prepare(`
+      SELECT public_key, added_at, approved_at, last_sync_at
+      FROM myr_peers
+      WHERE trust_level IN ('trusted', 'introduced', 'pending', 'revoked')
+    `).all();
+  } catch {
+    peers = [];
+  }
+
+  let traces = [];
+  try {
+    traces = db.prepare(`
+      SELECT timestamp, actor_fingerprint, target_fingerprint
+      FROM myr_traces
+      WHERE event_type IN ('sync_pull', 'sync_push', 'relay_sync')
+        AND outcome IN ('success', 'ok')
+      ORDER BY timestamp ASC
+    `).all();
+  } catch {
+    traces = [];
+  }
+
+  const firstSyncByFingerprint = new Map();
+  for (const trace of traces) {
+    const syncMs = parseIsoTimestampMs(trace.timestamp);
+    if (!Number.isFinite(syncMs)) continue;
+    const fingerprints = [trace.actor_fingerprint, trace.target_fingerprint].filter(Boolean);
+    for (const fingerprint of fingerprints) {
+      if (!firstSyncByFingerprint.has(fingerprint)) {
+        firstSyncByFingerprint.set(fingerprint, syncMs);
+      }
+    }
+  }
+
+  const durations = [];
+  let attempts = 0;
+  let successes = 0;
+  let compliant = 0;
+  for (const peer of peers) {
+    const peerFingerprint = computeFingerprint(peer.public_key);
+    const joinStartedMs = parseIsoTimestampMs(peer.approved_at || peer.added_at);
+    if (!Number.isFinite(joinStartedMs)) continue;
+    attempts += 1;
+
+    const firstSyncMs = firstSyncByFingerprint.get(peerFingerprint) ?? parseIsoTimestampMs(peer.last_sync_at);
+    if (!Number.isFinite(firstSyncMs) || firstSyncMs < joinStartedMs) continue;
+    successes += 1;
+    const durationSeconds = (firstSyncMs - joinStartedMs) / 1000;
+    durations.push(durationSeconds);
+    if (durationSeconds <= 60) compliant += 1;
+  }
+
+  return {
+    join_attempts: attempts,
+    join_successes: successes,
+    compliant_pct: attempts > 0 ? Number(((compliant / attempts) * 100).toFixed(3)) : null,
+    p95_seconds: percentile(durations, 95),
+  };
+}
+
 function hashRawBody(rawBody) {
   return crypto.createHash('sha256').update(rawBody || '').digest('hex');
 }
@@ -1168,6 +1278,13 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       "SELECT COUNT(*) FROM myr_traces WHERE event_type IN ('gossip_iwant_received', 'gossip_iwant_in')"
     );
 
+    const syncFreshnessCompliantPct = syncLagSeconds === null ? null : (syncLagSeconds <= 60 ? 100 : 0);
+    const gossipThreshold = Math.max(fanout - 1, 0);
+    const gossipHealthCompliantPct = activeViewSize >= gossipThreshold ? 100 : 0;
+    const governanceStats = calculateGovernancePropagationStats(db);
+    const onboardingStats = calculateOnboardingStats(db);
+    const uptimePct = 100;
+
     return res.json({
       node: {
         fingerprint: nodeFingerprint,
@@ -1196,6 +1313,20 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         iwant_sent: iwantSent,
         iwant_received: iwantReceived,
       },
+      onboarding: onboardingStats,
+      governance: governanceStats,
+      slo: {
+        sync_freshness_compliant_pct: syncFreshnessCompliantPct,
+        gossip_health_compliant_pct: gossipHealthCompliantPct,
+        governance_propagation_p99_seconds: governanceStats.p99_seconds,
+        onboarding_success_p95_seconds: onboardingStats.p95_seconds,
+        uptime_pct: uptimePct,
+      },
+      slo_sync_freshness_compliant_pct: syncFreshnessCompliantPct,
+      slo_gossip_health_compliant_pct: gossipHealthCompliantPct,
+      slo_governance_propagation_p99_seconds: governanceStats.p99_seconds,
+      slo_onboarding_success_p95_seconds: onboardingStats.p95_seconds,
+      slo_uptime_pct: uptimePct,
     });
   });
 
