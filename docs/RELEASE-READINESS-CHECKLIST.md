@@ -8,8 +8,8 @@ This checklist is the repo-level release truth for MYR.
 
 ## Release Authority Mapping
 
-- npm package version and tarball naming are `1.3.0` (`myr-system-1.3.0.tgz`).
-- Source-level release tag is `v1.3.0` and is authoritative for finalized release-documentation truth.
+- npm package version and tarball naming are `1.3.1` (`myr-system-1.3.1.tgz`).
+- Source-level release tag is `v1.3.1` and is authoritative for finalized release-documentation truth.
 - This is non-destructive: no existing pushed tags are rewritten.
 
 ## Gates
@@ -43,19 +43,21 @@ Observed result:
 Decision:
 `npm test` remains day-to-day developer truth. `npm run test:release` is the explicit release gate so onboarding truth is mandatory at publish time.
 
-## Files Touched For STA-214
+## Files Touched For STA-222
 
-- `lib/sync.js`
-- `server/index.js`
-- `test/gossip-scale.test.js`
-- `test/server.test.js`
-- `test/gossip-interop.test.js`
+- `docs/PILOT-BRIEF.md`
+- `docs/PILOT-OPERATING-MODEL.md`
+- `docs/SLO-DEFINITIONS.md`
+- `docs/DASHBOARD-TEMPLATES.md`
+- `scripts/slo-check.js`
+- `test/scale-acceptance.test.js`
+- `test/relay-saturation.test.js`
 - `package.json`
 - `package-lock.json`
 - `README.md`
 - `CHANGELOG.md`
 - `docs/RELEASE-READINESS-CHECKLIST.md`
-- `docs/RELEASE-NOTES-v1.3.0.md`
+- `docs/RELEASE-NOTES-v1.3.1.md`
 - `docs/OPERATOR-GUIDE.md`
 
 ## Prototype Residue / Non-Release Artifacts

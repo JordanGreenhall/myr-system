@@ -4,6 +4,15 @@
 
 ### Changed
 
+## [1.3.1] — 2026-04-24
+
+### Changed
+
+- Landed Gate D operating-wave truth from completed child lanes: pilot operating model docs (STA-218), scale acceptance tests (STA-219), and SLO/dashboard/checker deliverables (STA-220).
+- Restored publishability from dirty post-`v1.3.0` working tree by committing accepted Gate D files into release-truth history.
+- Advanced release/package authority to `myr-system@1.3.1` with canonical non-destructive source tag `v1.3.1`.
+- Explicitly preserved Gate D critical-path honesty: coordinator/domain routing (STA-217) remains open and is not treated as complete.
+
 ## [1.3.0] — 2026-04-24
 
 ### Changed

@@ -1,16 +1,17 @@
 # MYR Pilot Brief
 
 **For:** First release cohort operators
-**System version:** 1.2.0
+**System version:** 1.3.1
 **Date:** April 2026
+**Operating model:** See `docs/PILOT-OPERATING-MODEL.md` for cohort strategy, success metrics, and growth gates
 
 ---
 
 ## What You're Joining
 
-A small network (currently 3 nodes) that shares verified methodological yield — knowledge about what works, what fails, and what changes, captured from real work cycles and cryptographically signed.
+A growing network (currently 3 nodes, targeting 10,000+ participants) that shares verified methodological yield — knowledge about what works, what fails, and what changes, captured from real work cycles and cryptographically signed.
 
-MYR is not a messaging system. It is an intelligence compounding system. Your node captures what you learn. The network compounds it across participants.
+MYR is not a messaging system. It is an intelligence compounding system. Your node captures what you learn. The network compounds it across participants. Growth follows a cohort model with explicit gates at 10, 50, 200, 1,000, and 10,000+ nodes (see `docs/PILOT-OPERATING-MODEL.md`).
 
 ---
 
@@ -18,7 +19,7 @@ MYR is not a messaging system. It is an intelligence compounding system. Your no
 
 **Your node is immediately useful alone.** You can capture, search, verify, and synthesize your own yield without connecting to anyone. The local intelligence machine is fully operational.
 
-**Network exchange is real.** Ed25519-signed artifacts, pull-based incremental sync, 3-way fingerprint verification, DHT peer discovery, and relay fallback for nodes behind NAT. The protocol is tested across two-node end-to-end flows with 507 automated test cases.
+**Network exchange is real.** Ed25519-signed artifacts, bounded-fanout gossip transport (IHAVE/IWANT + Bloom anti-entropy), 3-way fingerprint verification, DHT peer discovery, and relay fallback for nodes behind NAT. The protocol is tested with 436 automated test cases and O(N*F) message complexity validated at N=1,000.
 
 **Onboarding is one step.** `curl | bash` install, or `myr join "<invite-url>"` to connect to an existing node.
 
@@ -32,7 +33,7 @@ MYR is not a messaging system. It is an intelligence compounding system. Your no
 
 **No yield revocation.** Once exported, a report cannot be recalled or invalidated.
 
-**Scale ceiling: ~100 nodes.** The current sync model is O(N^2). Beyond 100 active nodes, the architecture requires phases B–E from the roadmap.
+**Scale ceiling: ~2,000 nodes without coordinators.** v1.3.0 gossip transport supports O(N*F) scaling to ~2,000 nodes. Beyond that, domain coordinators are required (see `docs/ADR-scale-architecture.md` Phase 4). Coordinator architecture must be validated before 1,000 nodes — the hard intermediate rung — to avoid a scaling cliff on the path to 10,000+.
 
 ---
 
@@ -75,10 +76,10 @@ Stage progression is computed from your trace history — every coupling event i
 
 ## Risks and Honest Limits
 
-- **The network is small.** Three nodes. The value of cross-node synthesis scales with participation. At current size, local yield is the primary value.
-- **Sync is pull-based and periodic.** This is not real-time. Weekly cadence is the design point.
-- **Governance is minimal.** Contradiction detection exists. Operator-driven revocation does not. If bad yield enters the network, it stays until governance primitives are built.
-- **Key management is your responsibility.** Your Ed25519 keypair is your identity. Compromise means all your historical signatures are attributable to the attacker. Back up `~/.myr/keys/` securely.
+- **The network is small.** Three nodes. The value of cross-node synthesis scales with participation. At current size, local yield is the primary value. The cohort growth plan targets 10,000+ participants.
+- **Sync uses gossip transport.** Bounded-fanout gossip with push-lazy dissemination. Reports propagate epidemically in O(log_F(N)) hops. Weekly review cadence is the operational design point.
+- **Governance is network-wide.** Revocation and quarantine signals propagate via governance gossip. Contradiction detection and resolution workflows exist. Key rotation is supported. See `docs/SUPPORT-OPERATIONS.md` and `docs/RUNBOOKS.md` for incident and recovery procedures.
+- **Key management is your responsibility.** Your Ed25519 keypair is your identity. Compromise means all your historical signatures are attributable to the attacker. Back up `~/.myr/keys/` securely. Key rotation is available via `POST /myr/governance/key-rotate`.
 
 ---
 
@@ -102,4 +103,6 @@ myr start
 ```
 
 Questions on setup: see the Operator Guide (`docs/OPERATOR-GUIDE.md`).
+Growth plan and success metrics: see the Pilot Operating Model (`docs/PILOT-OPERATING-MODEL.md`).
+Scale architecture: see the ADR (`docs/ADR-scale-architecture.md`).
 Questions on the protocol: contact Jordan.
