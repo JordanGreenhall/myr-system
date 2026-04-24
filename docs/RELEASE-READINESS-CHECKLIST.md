@@ -8,8 +8,8 @@ This checklist is the repo-level release truth for MYR.
 
 ## Release Authority Mapping
 
-- npm package version and tarball naming remain `1.2.0` (`myr-system-1.2.0.tgz`).
-- Source-level correction tag is `v1.2.1` and is authoritative for finalized release-documentation truth.
+- npm package version and tarball naming are `1.2.2` (`myr-system-1.2.2.tgz`).
+- Source-level correction tag is `v1.2.2` and is authoritative for finalized release-documentation truth.
 - This split is intentional and non-destructive: no existing pushed tag is rewritten.
 
 ## Gates
@@ -53,7 +53,7 @@ Decision:
 - `test/cli.test.js`
 - `docs/RELEASE-READINESS-CHECKLIST.md`
 - `docs/RELEASE-NOTES-v1.2.0.md`
-- `docs/RELEASE-NOTES-v1.2.1.md`
+- `docs/RELEASE-NOTES-v1.2.2.md`
 - `docs/OPERATOR-GUIDE.md`
 
 ## Prototype Residue / Non-Release Artifacts

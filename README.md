@@ -187,8 +187,8 @@ npm run test:release
 
 ## Release Authority
 
-- npm publish artifact/version authority: `myr-system@1.2.0` (`myr-system-1.2.0.tgz`)
-- source/release-documentation authority: tag `v1.2.1` (non-destructive correction tag)
+- npm publish artifact/version authority: `myr-system@1.2.2` (`myr-system-1.2.2.tgz`)
+- source/release-documentation authority: tag `v1.2.2` (non-destructive correction tag)
 
 Normal operating path is invite-link onboarding plus live/background sync. Manual export/import exchange is an advanced/offline fallback mode.
 

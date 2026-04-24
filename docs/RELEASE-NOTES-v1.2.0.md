@@ -4,7 +4,7 @@
 **Protocol version:** 1.2.0
 **Status:** Operational for 3–100 nodes with live/background sync as the normal path
 
-> Release authority note (2026-04-24): the publishable npm package remains `myr-system@1.2.0`. Tag `v1.2.1` is a non-destructive source correction tag that points to the finalized release-documentation truth.
+> Release authority note (2026-04-24): the publishable npm package for final release truth is `myr-system@1.2.2`. Tag `v1.2.2` is the non-destructive source correction tag that points to finalized release-documentation truth.
 
 ---
 
