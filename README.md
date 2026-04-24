@@ -185,6 +185,13 @@ npm run test:release
 
 `npm test` is the default day-to-day suite. `npm run test:release` is the publish gate and deliberately includes `test/onboarding-truth-test.js`.
 
+## Release Authority
+
+- npm publish artifact/version authority: `myr-system@1.2.0` (`myr-system-1.2.0.tgz`)
+- source/release-documentation authority: tag `v1.2.1` (non-destructive correction tag)
+
+Normal operating path is invite-link onboarding plus live/background sync. Manual export/import exchange is an advanced/offline fallback mode.
+
 ## Integration with Agent Memory Systems
 
 MYR can be wired into existing agent memory systems so yield capture is automatic — no new habit required. See `docs/INTEGRATION-EXAMPLES.md` for two reference implementations:

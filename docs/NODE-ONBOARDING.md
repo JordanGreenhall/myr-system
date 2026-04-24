@@ -1,7 +1,7 @@
 # MYR Network — Node Onboarding Guide
 
-**Version:** 1.2.0
-**Date:** 2026-03-29
+**Version:** 1.2.1 (source correction docs)
+**Date:** 2026-04-24
 **For:** Incoming Node operators
 
 ---
@@ -10,7 +10,7 @@
 
 You're joining a small network that shares **Methodological Yield** — what we've actually learned, operationally, from real work cycles. Not reports. Not summaries. Findings that change how you work, proven by use.
 
-The system is called MYR (Methodological Yield Reports). It runs locally on your node. You capture what you learn, verify it, and share selected artifacts with other nodes on a weekly cadence. They do the same for you.
+The system is called MYR (Methodological Yield Reports). It runs locally on your node. You capture what you learn, verify it, and share selected artifacts with other nodes through live/background sync on the normal path. Manual file exchange remains available when needed.
 
 The protocol is deliberately simple at small scale (3–100 nodes).
 

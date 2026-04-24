@@ -2,7 +2,9 @@
 
 **Date:** March 29, 2026
 **Protocol version:** 1.2.0
-**Status:** Operational for 3–100 nodes on weekly cadence
+**Status:** Operational for 3–100 nodes with live/background sync as the normal path
+
+> Release authority note (2026-04-24): the publishable npm package remains `myr-system@1.2.0`. Tag `v1.2.1` is a non-destructive source correction tag that points to the finalized release-documentation truth.
 
 ---
 
@@ -85,7 +87,9 @@ New config options `auto_approve_verified_peers` and `auto_approve_min_protocol_
 
 ## Operational Limits
 
-v1.2.0 is designed and tested for **3–100 nodes** on a **weekly exchange cadence**.
+v1.2.0 is designed and tested for **3–100 nodes**.
+
+Normal operation uses invite-link onboarding plus live/background sync (`myr sync-all` or auto-sync agent). Manual file exchange is an advanced/offline fallback.
 
 Beyond that scale:
 - Every node reads every peer's yield directly — no filtering or routing

@@ -7,6 +7,8 @@
 - Default test suite (`npm test`) now has a corrected trust expectation for peer introduction auto-approval (`trusted` vs stale `introduced` expectation).
 - Added explicit release truth gate: `npm run test:release` now runs both default regression tests and onboarding acceptance truth (`test/onboarding-truth-test.js`).
 - Documentation now explicitly distinguishes default developer test truth vs release publish truth.
+- Clarified release authority split: npm package remains `1.2.0` while `v1.2.1` is the source-level correction tag for final release-documentation truth.
+- Removed stale release language that framed weekly exchange cadence as the normal path; normal path is invite-link onboarding plus live/background sync.
 
 ## [1.2.0] — 2026-03-29
 
