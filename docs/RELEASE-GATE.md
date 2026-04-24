@@ -3,7 +3,7 @@
 **Date:** 2026-04-24
 **Assessor:** Worf (Security & QA Officer)
 **Scope:** Governance, abuse resistance, observability, and release readiness
-**Test Baseline:** 388/389 tests pass (1 pre-existing failure in cli.test.js:498)
+**Test Baseline:** 423/423 tests pass
 
 ---
 
@@ -174,11 +174,8 @@ The system is release-ready for **controlled early-access deployment** with a de
 **Mitigation:** Node key stored in `~/.myr/` with user file permissions. Future: key rotation protocol.
 **Acceptable for release:** Yes — standard for v1.x peer-to-peer systems.
 
-### Risk 8: Pre-existing test failure (cli.test.js:498)
-**Description:** `announce-to` test expects `'introduced'` but code returns `'trusted'` (uncommitted working copy change).
-**Severity:** Low
-**Mitigation:** The code behavior (auto-approve fingerprint-valid introductions to `'trusted'`) is correct per the comment. The test assertion needs alignment.
-**Acceptable for release:** Yes — behavior is correct; test needs update.
+### ~~Risk 8: Pre-existing test failure (cli.test.js:498)~~ — RESOLVED
+Test expectation corrected in v1.2.0 release packaging. All 423 tests now pass.
 
 ---
 
@@ -195,14 +192,14 @@ None identified. All risks are bounded by the peer trust model and acceptable fo
 **Conditions:**
 1. Operators MUST deploy behind a reverse proxy with IP-based rate limiting for unauthenticated endpoints.
 2. Operators MUST understand revocation is local-only and coordinate out-of-band.
-3. The pre-existing test failure (`cli.test.js:498`) should be fixed (test expectation updated from `'introduced'` to `'trusted'`).
+3. ~~The pre-existing test failure (`cli.test.js:498`)~~ — Resolved. All 423 tests pass.
 
 **Strengths justifying release:**
 - Strong cryptographic foundation (Ed25519 signing, nonce replay protection, body hash in signature)
 - Comprehensive peer trust boundaries (revocation blocks sync at both client and server)
 - Governance controls are operational and auditable (revoke, quarantine, audit trail)
 - Progressive participation model with promotion/demotion criteria
-- 388/389 tests pass across 111 test suites
+- 423/423 tests pass across 122 test suites
 - Rate limiting on authenticated endpoints and relay
 - Quarantined yields properly excluded from recall
 

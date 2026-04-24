@@ -19,14 +19,14 @@ npm run test:release
 
 Observed result:
 
-- `npm test`: `tests 389`, `pass 389`, `fail 0`, `duration_ms 76135.985291`
+- `npm test`: `tests 423`, `pass 423`, `fail 0`
 - `npm run test:onboarding-truth`: `tests 3`, `pass 3`, `fail 0`, gate status `PASS`
 
 ## Pass/Fail Matrix
 
 | Gate | Status | Evidence |
 |---|---|---|
-| `npm test` | PASS | 389 tests, 111 suites, 0 failures |
+| `npm test` | PASS | 423 tests, 122 suites, 0 failures |
 | `npm run test:release` | PASS | default suite PASS + onboarding truth suite PASS |
 
 ## Included In Release Truth

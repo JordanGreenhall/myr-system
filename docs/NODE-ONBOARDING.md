@@ -1,8 +1,8 @@
 # MYR Network — Node Onboarding Guide
 
-**Version:** 1.1  
-**Date:** 2026-04-17  
-**For:** Incoming Node operators (Node 1, Node 2)
+**Version:** 1.2.0
+**Date:** 2026-03-29
+**For:** Incoming Node operators
 
 ---
 
@@ -12,7 +12,7 @@ You're joining a small network that shares **Methodological Yield** — what we'
 
 The system is called MYR (Methodological Yield Reports). It runs locally on your node. You capture what you learn, verify it, and share selected artifacts with other nodes on a weekly cadence. They do the same for you.
 
-The network is currently three nodes. The protocol is deliberately simple at this scale.
+The protocol is deliberately simple at small scale (3–100 nodes).
 
 ---
 
@@ -48,76 +48,9 @@ A node that only receives and never responds isn't in the protocol.
 
 ---
 
-## The Weekly Cycle
+## Join the Network
 
-The sharing protocol runs on a weekly cadence.
-
-### Step 1 — Review your week's yield
-
-Run the weekly synthesis:
-```bash
-node scripts/myr-weekly.js
-```
-
-Read the output with one question: **"Which of these findings would change how another node works if they had it?"**
-
-Select by priority:
-1. **Falsifications first** — always share these
-2. **Techniques** with confidence ≥ 0.7 and at least one real application
-3. **Skip** insights that are still speculative or highly context-specific to your work
-
-Note the IDs you want to export.
-
-### Step 2 — Create the export artifact
-
-```bash
-node scripts/myr-export.js --ids "n1-20260220-003,n1-20260221-001"
-# Output: exports/2026-02-27-n1.myr.json
-```
-
-Only your verified MYRs are exportable. The gate is enforced automatically.
-
-### Step 3 — Share
-
-Push your export file to the shared `yields/` directory in the repo:
-
-```
-samuel-workspace/
-└── yields/
-    ├── 2026-02-27-n1.myr.json
-    ├── 2026-02-27-n2.myr.json
-    └── 2026-02-27-n3.myr.json
-```
-
-The files are self-authenticating (Ed25519 signed). No secure channel required for transport.
-
-### Step 4 — Import from other nodes
-
-Pull the repo and import new artifacts from peers:
-
-```bash
-node scripts/myr-import.js --file ./yields/2026-02-27-n2.myr.json --peer-key ./keys/n2.public.pem
-```
-
-The import tool verifies the signature, checks for duplicates, and writes to your local database.
-
-### Step 5 — Respond
-
-After reviewing imported artifacts, reply to the shared thread (Signal, git comment, or whatever channel your network uses):
-
-> "Imported 2026-02-27-n1.myr.json. Applied `n1-20260221-001` [technique name] in [session/domain]. Outcome: [one sentence]. Two others queued for review next week."
-
-Or if nothing applied:
-
-> "Imported 2026-02-27-n1.myr.json. Read all three. Nothing directly applicable this cycle — `n1-20260223-007` is relevant to upcoming work, flagged for next week."
-
-Respond within one week of import.
-
----
-
-## Bootstrap: Invite-Link Join
-
-Before the weekly cycle, run a one-time invite-link bootstrap:
+### Invite-link join (normal path)
 
 1. Existing node runs `myr invite create` and shares the `myr://invite/...` URL.
 2. New node runs `myr join "<invite-url>"`.
@@ -125,7 +58,38 @@ Before the weekly cycle, run a one-time invite-link bootstrap:
 4. Both nodes exchange one verified MYR and acknowledge receipt.
 5. Each side applies one received MYR and reports outcome in the shared thread.
 
-Bootstrap complete. You're now at coupling level: **Coordinate**.
+Join complete. You're now at coupling level: **Coordinate**.
+
+After joining, yield exchange happens automatically via live sync (`myr sync-all` or the auto-sync agent). See the [Operator Guide](OPERATOR-GUIDE.md) for sync details.
+
+---
+
+## The Weekly Cycle
+
+Run weekly synthesis to review what your node has accumulated:
+
+```bash
+node scripts/myr-weekly.js
+```
+
+Read the output with one question: **"Which of these findings would change how another node works if they had it?"**
+
+Priority: **Falsifications first** (always share), then techniques with confidence ≥ 0.7 and at least one real application. Skip insights that are still speculative.
+
+With live sync enabled, verified yield (rating ≥ 3) is shared automatically. The weekly synthesis is your review checkpoint, not a manual export step.
+
+### Manual file-based exchange (advanced / offline)
+
+If live sync is unavailable, you can export and import artifacts manually:
+
+```bash
+# Export
+node scripts/myr-export.js --all
+# Import from peer
+node scripts/myr-import.js --file ./imports/peer-export.myr.json --peer-key ./keys/peer.public.pem
+```
+
+After importing, respond to the sharing thread within one week — acknowledge what you applied and what you queued for review.
 
 ---
 
