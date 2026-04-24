@@ -4,6 +4,14 @@
 
 ### Changed
 
+## [1.2.3] — 2026-04-24
+
+### Changed
+
+- Elevated the scale-framing correction commit to publishable release truth without rewriting any existing pushed tag.
+- Updated release authority mapping to `myr-system@1.2.3` and canonical source tag `v1.2.3`.
+- Added final release-authority notes for `v1.2.3` and aligned release checklist/operator docs references.
+
 ## [1.2.2] — 2026-04-24
 
 ### Changed

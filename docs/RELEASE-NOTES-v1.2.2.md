@@ -1,5 +1,8 @@
 # MYR v1.2.2 Final Release Authority Notes
 
+**Status:** Superseded by v1.2.3
+**Current authoritative source tag:** v1.2.3
+
 **Date:** April 24, 2026
 **Type:** Non-destructive source/package authority correction
 **Package version:** 1.2.2
@@ -23,5 +26,5 @@ No existing pushed tags are rewritten.
 
 When preparing or auditing release operations:
 
-1. Use package metadata and tarball naming for npm publish mechanics (`1.2.2`).
-2. Use tag `v1.2.2` as the canonical source reference for final release-documentation truth.
+1. Use package metadata and tarball naming for npm publish mechanics (`1.2.3`).
+2. Use tag `v1.2.3` as the canonical source reference for final release-documentation truth.

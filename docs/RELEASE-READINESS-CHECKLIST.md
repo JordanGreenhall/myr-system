@@ -8,8 +8,8 @@ This checklist is the repo-level release truth for MYR.
 
 ## Release Authority Mapping
 
-- npm package version and tarball naming are `1.2.2` (`myr-system-1.2.2.tgz`).
-- Source-level correction tag is `v1.2.2` and is authoritative for finalized release-documentation truth.
+- npm package version and tarball naming are `1.2.3` (`myr-system-1.2.3.tgz`).
+- Source-level correction tag is `v1.2.3` and is authoritative for finalized release-documentation truth.
 - This split is intentional and non-destructive: no existing pushed tag is rewritten.
 
 ## Gates
@@ -43,17 +43,15 @@ Observed result:
 Decision:
 `npm test` remains day-to-day developer truth. `npm run test:release` is the explicit release gate so onboarding truth is mandatory at publish time.
 
-## Files Touched For STA-171
+## Files Touched For STA-199
 
-- `.gitignore`
 - `package.json`
+- `package-lock.json`
 - `README.md`
-- `docs/NODE-ONBOARDING.md`
 - `CHANGELOG.md`
-- `test/cli.test.js`
 - `docs/RELEASE-READINESS-CHECKLIST.md`
-- `docs/RELEASE-NOTES-v1.2.0.md`
 - `docs/RELEASE-NOTES-v1.2.2.md`
+- `docs/RELEASE-NOTES-v1.2.3.md`
 - `docs/OPERATOR-GUIDE.md`
 
 ## Prototype Residue / Non-Release Artifacts
