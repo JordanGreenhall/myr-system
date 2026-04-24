@@ -5,7 +5,12 @@ const assert = require('node:assert/strict');
 const http = require('http');
 const Database = require('better-sqlite3');
 const { createApp } = require('../server/index');
-const { detectContradictions } = require('../lib/contradictions');
+const {
+  detectContradictions,
+  resolveContradiction,
+  getStoredContradictions,
+} = require('../lib/contradictions');
+const { generateKeypair, sign, fingerprint: computeFingerprint } = require('../lib/crypto');
 const { listContradictions } = require('../bin/myr');
 
 function get(port, path) {
@@ -93,6 +98,32 @@ describe('detectContradictions', () => {
     const stored = db.prepare('SELECT * FROM myr_contradictions ORDER BY id ASC').all();
     assert.ok(stored.length >= 2);
     assert.ok(stored.every((row) => row.yield_a_id && row.yield_b_id));
+  });
+
+  it('marks contradiction resolved and excludes it from active list', () => {
+    const baseline = detectContradictions(db, { domain: 'rag' });
+    const target = baseline.contradictions[0];
+    assert.ok(target, 'Expected at least one contradiction to resolve');
+
+    const signer = generateKeypair();
+    const resolvedBy = computeFingerprint(signer.publicKey);
+    const resolutionRecord = JSON.stringify({
+      contradiction_id: target.id,
+      resolved_by: resolvedBy,
+      resolution_note: 'Operator adjudicated',
+    });
+
+    const updated = resolveContradiction(db, {
+      contradictionId: target.id,
+      resolvedBy,
+      resolutionNote: 'Operator adjudicated',
+      resolutionSignature: sign(resolutionRecord, signer.privateKey),
+    });
+    assert.ok(updated);
+    assert.ok(updated.resolved_at);
+
+    const active = getStoredContradictions(db, 'rag', { includeResolved: false });
+    assert.ok(!active.some((row) => row.id === target.id));
   });
 });
 

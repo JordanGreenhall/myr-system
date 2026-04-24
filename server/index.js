@@ -6,7 +6,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { errorResponse } = require('./lib/errors');
 const { createAuthMiddleware } = require('./middleware/auth');
-const { createRateLimiter } = require('./middleware/rate-limit');
+const { createRateLimiter, createIpRateLimiter } = require('./middleware/rate-limit');
 const { canonicalize } = require('../lib/canonicalize');
 const { sign: signMessage, verify: verifySignature, fingerprint: computeFingerprint } = require('../lib/crypto');
 const { httpFetch, makeSignedHeaders } = require('../lib/sync');
@@ -15,7 +15,20 @@ const { writeTrace } = require('../lib/trace');
 const { recall, explainYield } = require('../lib/recall');
 const { scoreReport, rankReports, explainYield: explainYieldDirect } = require('../lib/yield-scoring');
 const { synthesize, validateSynthesisRequest } = require('../lib/synthesis');
-const { detectContradictions, ensureContradictionsSchema, normalizeDomain } = require('../lib/contradictions');
+const {
+  detectContradictions,
+  ensureContradictionsSchema,
+  normalizeDomain,
+  resolveContradiction,
+  listContradictionResolutions,
+} = require('../lib/contradictions');
+const {
+  ensureGovernanceGossipSchema,
+  createGovernanceSignal,
+  ingestGovernanceSignal,
+  listGovernanceSignals,
+} = require('../lib/governance-gossip');
+const { rotateNodeKeypair } = require('../lib/key-rotation');
 const { enforceStage, computeStage, getPeerDomainTrust, STAGES } = require('../lib/participation');
 const {
   DEFAULT_PROPAGATION_HOPS,
@@ -29,6 +42,7 @@ const {
   getActiveSubscriptionsForOwner,
   reportMatchesSubscriptions,
 } = require('../lib/subscriptions');
+const { createLogger } = require('../lib/logging');
 
 function loadPublicKeyHex(keysPath, nodeId) {
   const publicKeyPath = path.join(keysPath, `${nodeId}.public.pem`);
@@ -77,6 +91,27 @@ function computeHealthStatus(value, thresholds) {
 
 function hashRawBody(rawBody) {
   return crypto.createHash('sha256').update(rawBody || '').digest('hex');
+}
+
+function parseDomainTags(domainTags) {
+  if (!domainTags) return [];
+  if (Array.isArray(domainTags)) return domainTags.map((tag) => String(tag).trim()).filter(Boolean);
+  if (typeof domainTags === 'string') {
+    const trimmed = domainTags.trim();
+    if (!trimmed) return [];
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          return parsed.map((tag) => String(tag).trim()).filter(Boolean);
+        }
+      } catch {
+        // Fallback to CSV parser below.
+      }
+    }
+    return trimmed.split(',').map((tag) => tag.trim()).filter(Boolean);
+  }
+  return [];
 }
 
 function verifyOptionalSignedRequest(req) {
@@ -190,17 +225,64 @@ function ensureApplicationsSchema(db) {
   `);
 }
 
+function ensureRoutingEconomicsSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS myr_routing_cycles (
+      cycle_id TEXT PRIMARY KEY,
+      peer_public_key TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      ended_at TEXT NOT NULL,
+      bytes_sent INTEGER NOT NULL DEFAULT 0,
+      bytes_received INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_routing_cycles_peer ON myr_routing_cycles(peer_public_key, ended_at DESC);
+    CREATE TABLE IF NOT EXISTS myr_routing_relay_costs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      peer_public_key TEXT NOT NULL,
+      relay_bytes INTEGER NOT NULL DEFAULT 0,
+      relay_requests INTEGER NOT NULL DEFAULT 0,
+      recorded_at TEXT NOT NULL,
+      metadata TEXT DEFAULT '{}'
+    );
+    CREATE INDEX IF NOT EXISTS idx_routing_relay_peer ON myr_routing_relay_costs(peer_public_key, recorded_at DESC);
+  `);
+}
+
 /**
  * Create the Express app. Accepts explicit publicKeyHex/createdAt for testing,
  * otherwise loads from the filesystem using config.keys_path and config.node_id.
  */
 function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
   const app = express();
+  const logger = createLogger({ base: { component: 'myr-server' } });
   app.use(express.json({
     verify: (req, res, buf) => {
       req.rawBody = buf.toString('utf8');
     },
   }));
+  app.use((req, res, next) => {
+    const started = process.hrtime.bigint();
+    res.on('finish', () => {
+      const durationMs = Number(process.hrtime.bigint() - started) / 1_000_000;
+      const candidatePublicKey = req.auth?.publicKey || req.headers['x-myr-public-key'] || null;
+      let peerFingerprint = null;
+      if (candidatePublicKey) {
+        try {
+          peerFingerprint = computeFingerprint(String(candidatePublicKey));
+        } catch {
+          peerFingerprint = null;
+        }
+      }
+      logger.info('http_access', {
+        method: req.method,
+        path: req.path,
+        status: res.statusCode,
+        duration_ms: Math.round(durationMs),
+        peer_fingerprint: peerFingerprint,
+      });
+    });
+    next();
+  });
 
   const port = config.port || 3719;
   const nodeUrl = config.node_url || `http://localhost:${port}`;
@@ -231,6 +313,14 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
   ensureContradictionsSchema(db);
   ensureApplicationsSchema(db);
   ensureSubscriptionsSchema(db);
+  ensureGovernanceGossipSchema(db);
+  ensureRoutingEconomicsSchema(db);
+
+  app.use(createIpRateLimiter({
+    windowMs: 60 * 1000,
+    maxRequests: config.rate_limit?.unauthenticated_requests_per_minute || 30,
+    paths: ['/.well-known/myr-node', '/myr/health', '/myr/discover', '/myr/introduce', '/myr/peer/introduce'],
+  }));
 
   // --- Discovery endpoint (no auth) ---
   app.get('/.well-known/myr-node', (req, res) => {
@@ -852,6 +942,18 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
 
       try {
         const proxyRes = await httpFetch(targetUrl, forwardOptions);
+        const relayBytes = Buffer.byteLength(payload_b64 || '', 'utf8');
+        db.prepare(`
+          INSERT INTO myr_routing_relay_costs (
+            peer_public_key, relay_bytes, relay_requests, recorded_at, metadata
+          ) VALUES (?, ?, ?, ?, ?)
+        `).run(
+          senderPeer.public_key,
+          relayBytes,
+          1,
+          new Date().toISOString(),
+          JSON.stringify({ method, path: urlPath, target_fingerprint: to_fingerprint })
+        );
 
         if (publicKeyHex) {
           writeTrace(db, {
@@ -977,6 +1079,112 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         : 0,
     };
   }
+
+  // --- Network metrics endpoint (auth required; local operator or trusted peer) ---
+  app.get('/myr/metrics', (req, res) => {
+    const isLocalOperator = publicKeyHex && req.auth.publicKey === publicKeyHex;
+    if (!isLocalOperator && !requireTrustedPeer(req, res, 'canSync')) return;
+
+    const now = Date.now();
+    const uptimeSeconds = Math.floor((now - startedAt) / 1000);
+    const nodeFingerprint = publicKeyHex ? computeFingerprint(publicKeyHex) : null;
+
+    const peersTotal = safeCount(db, 'SELECT COUNT(*) FROM myr_peers');
+    const peersTrusted = safeCount(db, "SELECT COUNT(*) FROM myr_peers WHERE trust_level = 'trusted'");
+    const fanout = Number.isFinite(Number(config.gossip?.fanout))
+      ? Number(config.gossip.fanout)
+      : 5;
+    const passiveSize = Number.isFinite(Number(config.gossip?.passiveSize))
+      ? Number(config.gossip.passiveSize)
+      : 20;
+    const activeViewSize = Math.min(peersTrusted, fanout);
+    const passiveViewSize = Math.min(Math.max(peersTrusted - activeViewSize, 0), passiveSize);
+
+    const reportsLocal = safeCount(
+      db,
+      "SELECT COUNT(*) FROM myr_reports WHERE imported_from IS NULL OR imported_from = ''"
+    );
+    const reportsImported = safeCount(
+      db,
+      "SELECT COUNT(*) FROM myr_reports WHERE imported_from IS NOT NULL AND imported_from != ''"
+    );
+    let byDomain = {};
+    try {
+      const rows = db.prepare('SELECT domain_tags FROM myr_reports').all();
+      const counts = new Map();
+      for (const row of rows) {
+        for (const tag of parseDomainTags(row.domain_tags)) {
+          counts.set(tag, (counts.get(tag) || 0) + 1);
+        }
+      }
+      byDomain = Object.fromEntries([...counts.entries()].sort((a, b) => b[1] - a[1]));
+    } catch {
+      byDomain = {};
+    }
+
+    const lastSyncRow = safeGet(
+      db,
+      'SELECT MAX(last_sync_at) AS val FROM myr_peers WHERE last_sync_at IS NOT NULL'
+    );
+    const lastSyncAt = lastSyncRow && lastSyncRow.val ? lastSyncRow.val : null;
+    const syncLagSeconds = lastSyncAt
+      ? Math.max(0, Math.floor((now - new Date(lastSyncAt).getTime()) / 1000))
+      : null;
+
+    const syncMessages = safeCount(
+      db,
+      "SELECT COUNT(*) FROM myr_traces WHERE event_type IN ('sync_pull', 'sync_push', 'relay_sync')"
+    );
+    const cycleCount = safeCount(db, 'SELECT COUNT(*) FROM myr_routing_cycles');
+    const messagesPerCycle = cycleCount > 0 ? Number((syncMessages / cycleCount).toFixed(3)) : null;
+
+    const ihaveSent = safeCount(
+      db,
+      "SELECT COUNT(*) FROM myr_traces WHERE event_type = 'gossip_ihave' AND outcome IN ('sent', 'success')"
+    );
+    const ihaveReceived = safeCount(
+      db,
+      "SELECT COUNT(*) FROM myr_traces WHERE event_type IN ('gossip_ihave_received', 'gossip_ihave_in')"
+    );
+    const iwantSent = safeCount(
+      db,
+      "SELECT COUNT(*) FROM myr_traces WHERE event_type IN ('gossip_iwant', 'gossip_iwant_sent') AND outcome IN ('sent', 'success')"
+    );
+    const iwantReceived = safeCount(
+      db,
+      "SELECT COUNT(*) FROM myr_traces WHERE event_type IN ('gossip_iwant_received', 'gossip_iwant_in')"
+    );
+
+    return res.json({
+      node: {
+        fingerprint: nodeFingerprint,
+        uptime_seconds: uptimeSeconds,
+      },
+      peers: {
+        total: peersTotal,
+        trusted: peersTrusted,
+        active_gossip_view: activeViewSize,
+      },
+      reports: {
+        local: reportsLocal,
+        imported: reportsImported,
+        by_domain: byDomain,
+      },
+      sync: {
+        last_sync_at: lastSyncAt,
+        sync_lag_seconds: syncLagSeconds,
+        messages_per_cycle: messagesPerCycle,
+      },
+      gossip: {
+        active_view_size: activeViewSize,
+        passive_view_size: passiveViewSize,
+        ihave_sent: ihaveSent,
+        ihave_received: ihaveReceived,
+        iwant_sent: iwantSent,
+        iwant_received: iwantReceived,
+      },
+    });
+  });
 
   // --- Peer approve endpoint (auth required — local operator key only) ---
   app.post('/myr/peer/approve', (req, res) => {
@@ -1234,6 +1442,8 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       ORDER BY quarantined_at DESC
       LIMIT ?
     `).all(limit);
+    const contradictionResolutions = listContradictionResolutions(db, { limit });
+    const governanceSignals = listGovernanceSignals(db, { limit });
 
     return res.json({
       limit,
@@ -1245,6 +1455,8 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         sync_events: syncEvents,
         quarantines,
         quarantined_yields: quarantinedYields,
+        contradiction_resolutions: contradictionResolutions,
+        governance_signals: governanceSignals,
       },
     });
   });
@@ -1285,6 +1497,21 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         previous_trust_level: found.trust_level,
       },
     });
+
+    if (privateKeyHex && publicKeyHex) {
+      const signal = createGovernanceSignal({
+        actionType: 'revoke',
+        targetId: found.public_key,
+        payload: {
+          previous_trust_level: found.trust_level,
+          revoked_at: now,
+          actor_fingerprint: computeFingerprint(req.auth.publicKey),
+        },
+        signerPublicKey: publicKeyHex,
+        signerPrivateKey: privateKeyHex,
+      });
+      ingestGovernanceSignal(db, signal, { applySignal: false });
+    }
 
     const updated = db.prepare('SELECT * FROM myr_peers WHERE public_key = ?').get(found.public_key);
     return res.json({ status: 'revoked', peer: updated });
@@ -1340,8 +1567,79 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       },
     });
 
+    if (privateKeyHex && publicKeyHex) {
+      const signal = createGovernanceSignal({
+        actionType: 'quarantine',
+        targetId: yield_id,
+        payload: {
+          quarantined_by: actorFingerprint,
+          reason,
+          quarantined_at: now,
+        },
+        signerPublicKey: publicKeyHex,
+        signerPrivateKey: privateKeyHex,
+      });
+      ingestGovernanceSignal(db, signal, { applySignal: false });
+    }
+
     const row = db.prepare('SELECT * FROM myr_quarantined_yields WHERE yield_id = ?').get(yield_id);
     return res.json({ status: 'quarantined', quarantine: row });
+  });
+
+  app.post('/myr/contradictions/:id/resolve', (req, res) => {
+    if (!requireLocalOperator(req, res)) return;
+    const contradictionId = Number(req.params.id);
+    if (!Number.isInteger(contradictionId) || contradictionId <= 0) {
+      return errorResponse(res, 'invalid_request', 'Invalid contradiction id');
+    }
+    const resolutionNote = req.body?.resolution_note || null;
+    const resolvedBy = computeFingerprint(req.auth.publicKey);
+    const resolutionRecord = JSON.stringify({
+      contradiction_id: contradictionId,
+      resolved_by: resolvedBy,
+      resolution_note: resolutionNote,
+      resolved_at: new Date().toISOString(),
+    });
+    const resolutionSignature = privateKeyHex ? signMessage(resolutionRecord, privateKeyHex) : null;
+
+    const updated = resolveContradiction(db, {
+      contradictionId,
+      resolvedBy,
+      resolutionNote,
+      resolutionSignature,
+    });
+    if (!updated) {
+      return errorResponse(res, 'not_found', `No contradiction with id ${contradictionId}`);
+    }
+    return res.json({ status: 'resolved', contradiction: updated });
+  });
+
+  app.post('/myr/governance/key-rotate', (req, res) => {
+    if (!requireLocalOperator(req, res)) return;
+    if (!publicKeyHex || !privateKeyHex) {
+      return errorResponse(res, 'internal_error', 'Cannot rotate keys without local keypair');
+    }
+    const nodeId = req.body?.node_id || config.node_id || computeFingerprint(publicKeyHex);
+    const { newKeypair, announcement } = rotateNodeKeypair({
+      nodeId,
+      oldPublicKey: publicKeyHex,
+      oldPrivateKey: privateKeyHex,
+    });
+
+    const signal = createGovernanceSignal({
+      actionType: 'key_rotation',
+      targetId: nodeId,
+      payload: announcement,
+      signerPublicKey: publicKeyHex,
+      signerPrivateKey: privateKeyHex,
+    });
+    ingestGovernanceSignal(db, signal, { applySignal: false });
+
+    return res.json({
+      status: 'rotation_announced',
+      announcement,
+      new_keypair: newKeypair,
+    });
   });
 
   // --- Peer list endpoint (auth required) ---
@@ -2046,7 +2344,10 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
         setTimeout(() => reject(new Error('Reciprocal announce timeout (5s)')), 5000)
       );
       Promise.race([fetchPromise, timeoutPromise]).catch((err) => {
-        console.error(`Reciprocal announce to ${body.peer_url} failed: ${err.message}`);
+        logger.warn('reciprocal_announce_failed', {
+          peer_url: body.peer_url,
+          error: err.message,
+        });
       });
     }
 
@@ -2103,6 +2404,19 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
 
     return peer;
   }
+
+  app.post('/myr/governance/gossip', (req, res) => {
+    if (!requireTrustedPeer(req, res, 'canSync')) return;
+    const signal = req.body?.signal;
+    if (!signal || typeof signal !== 'object') {
+      return errorResponse(res, 'invalid_request', 'Missing governance signal payload');
+    }
+    const result = ingestGovernanceSignal(db, signal, { applySignal: true });
+    if (!result.accepted) {
+      return res.json({ status: 'ignored', reason: result.reason });
+    }
+    return res.json({ status: 'accepted', forward: result.forward });
+  });
 
   // --- Report fetch endpoint (auth required, trusted peers with canReceiveYield) ---
   app.get('/myr/reports/:signature', (req, res) => {
@@ -2214,11 +2528,21 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
     db.prepare('UPDATE myr_peers SET last_sync_at = ? WHERE public_key = ?')
       .run(new Date().toISOString(), peerPublicKey);
 
-    res.json({
+    const responseBody = {
       sync_id: syncId,
       status: 'started',
       estimated_reports: estimatedReports,
-    });
+    };
+    const now = new Date().toISOString();
+    const requestBytes = Buffer.byteLength(JSON.stringify(req.body || {}), 'utf8');
+    const responseBytes = Buffer.byteLength(JSON.stringify(responseBody), 'utf8');
+    db.prepare(`
+      INSERT INTO myr_routing_cycles (
+        cycle_id, peer_public_key, started_at, ended_at, bytes_sent, bytes_received
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(syncId, peerPublicKey, now, now, responseBytes, requestBytes);
+
+    res.json(responseBody);
   });
 
   return app;

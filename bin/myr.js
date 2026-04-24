@@ -1057,10 +1057,24 @@ function getDbFromNodeConfig(nodeConfig) {
         details TEXT DEFAULT '{}',
         detected_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
+        resolved_at TEXT,
+        resolved_by TEXT,
+        resolution_note TEXT,
         UNIQUE(yield_a_id, yield_b_id, contradiction_type, domain_tag)
       );
       CREATE INDEX IF NOT EXISTS idx_contradictions_domain ON myr_contradictions(domain_tag);
       CREATE INDEX IF NOT EXISTS idx_contradictions_updated ON myr_contradictions(updated_at DESC);
+      CREATE TABLE IF NOT EXISTS myr_contradiction_resolutions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        contradiction_id INTEGER NOT NULL,
+        resolved_at TEXT NOT NULL,
+        resolved_by TEXT NOT NULL,
+        resolution_note TEXT,
+        resolution_signature TEXT,
+        resolution_record TEXT NOT NULL,
+        FOREIGN KEY(contradiction_id) REFERENCES myr_contradictions(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_contradiction_resolutions_id ON myr_contradiction_resolutions(contradiction_id, resolved_at DESC);
     `);
     return db;
   }

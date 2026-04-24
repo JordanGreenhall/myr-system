@@ -6,6 +6,12 @@ const Database = require('better-sqlite3');
 const http = require('http');
 const { createApp } = require('../server/index');
 const { generateKeypair } = require('../lib/crypto');
+const { createGovernanceSignal, ingestGovernanceSignal } = require('../lib/governance-gossip');
+const {
+  rotateNodeKeypair,
+  verifyKeyRotationAnnouncement,
+  applyKeyRotation,
+} = require('../lib/key-rotation');
 const { authedRequest } = require('./helpers/peerRequest');
 
 function get(port, path) {
@@ -88,6 +94,32 @@ function createTestDb() {
       artifact_signature TEXT,
       outcome TEXT NOT NULL CHECK(outcome IN ('success','failure','rejected')),
       rejection_reason TEXT,
+      metadata TEXT DEFAULT '{}'
+    );
+  `);
+  return db;
+}
+
+function createGovernanceNodeDb() {
+  const db = new Database(':memory:');
+  db.exec(`
+    CREATE TABLE myr_peers (
+      id INTEGER PRIMARY KEY,
+      peer_url TEXT,
+      operator_name TEXT,
+      public_key TEXT UNIQUE NOT NULL,
+      trust_level TEXT DEFAULT 'pending',
+      added_at TEXT NOT NULL,
+      approved_at TEXT
+    );
+    CREATE TABLE myr_quarantined_yields (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      yield_id TEXT NOT NULL UNIQUE,
+      quarantined_at TEXT NOT NULL,
+      quarantined_by TEXT NOT NULL,
+      operator_signature TEXT NOT NULL,
+      reason TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
       metadata TEXT DEFAULT '{}'
     );
   `);
@@ -210,5 +242,56 @@ describe('governance endpoints', () => {
     assert.ok(Array.isArray(res.body.audit.quarantined_yields));
     assert.ok(res.body.audit.revocations.length >= 1);
     assert.ok(res.body.audit.quarantined_yields.length >= 1);
+  });
+
+  it('propagates revocation gossip to another node within TTL', () => {
+    const nodeA = generateKeypair();
+    const nodeB = generateKeypair();
+    const dbA = createGovernanceNodeDb();
+    const dbC = createGovernanceNodeDb();
+
+    for (const localDb of [dbA, dbC]) {
+      localDb.prepare(
+        'INSERT INTO myr_peers (peer_url, operator_name, public_key, trust_level, added_at, approved_at) VALUES (?, ?, ?, ?, ?, ?)'
+      ).run('https://b.local', 'node-b', nodeB.publicKey, 'trusted', '2026-04-24T12:00:00Z', '2026-04-24T12:00:00Z');
+    }
+
+    const signal = createGovernanceSignal({
+      actionType: 'revoke',
+      targetId: nodeB.publicKey,
+      payload: { reason: 'compromised key' },
+      signerPublicKey: nodeA.publicKey,
+      signerPrivateKey: nodeA.privateKey,
+      ttl: 2,
+    });
+
+    const acceptedByA = ingestGovernanceSignal(dbA, signal, { applySignal: true });
+    assert.equal(acceptedByA.accepted, true);
+    assert.equal(acceptedByA.forward.ttl, 1);
+
+    const acceptedByC = ingestGovernanceSignal(dbC, acceptedByA.forward, { applySignal: true });
+    assert.equal(acceptedByC.accepted, true);
+    assert.equal(acceptedByC.forward, null);
+
+    const cPeer = dbC.prepare('SELECT trust_level FROM myr_peers WHERE public_key = ?').get(nodeB.publicKey);
+    assert.equal(cPeer.trust_level, 'revoked');
+
+    dbA.close();
+    dbC.close();
+  });
+
+  it('creates verifiable key rotation announcement and applies registry update', () => {
+    const current = generateKeypair();
+    const { newKeypair, announcement } = rotateNodeKeypair({
+      nodeId: 'node-local',
+      oldPublicKey: current.publicKey,
+      oldPrivateKey: current.privateKey,
+    });
+
+    assert.equal(verifyKeyRotationAnnouncement(announcement), true);
+    const registry = [{ node_id: 'node-local', public_key: current.publicKey }];
+    const updated = applyKeyRotation({ registry, announcement });
+    assert.equal(updated.public_key, newKeypair.publicKey);
+    assert.equal(updated.previous_public_key, current.publicKey);
   });
 });
