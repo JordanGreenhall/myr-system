@@ -205,7 +205,8 @@ describe('GET /.well-known/myr-node', () => {
     assert.equal(body.public_key, TEST_PUBLIC_KEY);
     assert.equal(body.public_key.length, 64);
     assert.deepEqual(body.capabilities,
-      ['report-sync', 'peer-discovery', 'incremental-sync']);
+      ['report-sync', 'peer-discovery', 'incremental-sync', 'gossip-ihave-iwant', 'gossip-bloom-anti-entropy']);
+    assert.equal(body.gossip_protocol_version, '1.0.0');
     assert.equal(body.created_at, TEST_CREATED_AT);
     assert.equal(body.rate_limits.requests_per_minute, 60);
     assert.equal(body.rate_limits.min_sync_interval_minutes, 15);

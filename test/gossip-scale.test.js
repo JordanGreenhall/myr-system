@@ -527,6 +527,29 @@ describe('Gossip-based scale sync', () => {
     assert.ok(reductionFactor > 10, `Expected >10x reduction, got ${reductionFactor.toFixed(1)}x`);
   });
 
+  it('demonstrates O(N*F) upper bound explicitly at N=1000', () => {
+    const nodeCount = 1000;
+    const fullMeshPerCycle = nodeCount * (nodeCount - 1);
+
+    // One representative node with 999 trusted peers still keeps only F active links.
+    const pss = new PeerSamplingService({ fanout: DEFAULT_FANOUT, passiveSize: 20 });
+    const peers = Array.from({ length: nodeCount - 1 }, (_, i) => ({
+      public_key: `pk-${i}`,
+      operator_name: `node-${i}`,
+      peer_url: `http://node-${i}:9000`,
+    }));
+    pss.initializeFromPeers(peers);
+
+    const perNodeMessages = pss.getActivePeers().length;
+    const gossipUpperBoundPerCycle = nodeCount * perNodeMessages;
+    const reductionFactor = fullMeshPerCycle / gossipUpperBoundPerCycle;
+
+    assert.equal(perNodeMessages, DEFAULT_FANOUT);
+    assert.equal(gossipUpperBoundPerCycle, 5000);
+    assert.ok(gossipUpperBoundPerCycle < fullMeshPerCycle / 100);
+    assert.ok(reductionFactor > 150, `Expected >150x reduction, got ${reductionFactor.toFixed(1)}x`);
+  });
+
   it('documents gossip scale findings', async () => {
     const results = [];
 

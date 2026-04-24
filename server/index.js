@@ -43,6 +43,7 @@ const {
   reportMatchesSubscriptions,
 } = require('../lib/subscriptions');
 const { createLogger } = require('../lib/logging');
+const { processIhave, buildIwantMessage, GossipEngine } = require('../lib/gossip');
 
 function loadPublicKeyHex(keysPath, nodeId) {
   const publicKeyPath = path.join(keysPath, `${nodeId}.public.pem`);
@@ -350,7 +351,14 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
       node_uuid: config.node_uuid || null,
       public_key: publicKeyHex,
       fingerprint: computeFingerprint(publicKeyHex),
-      capabilities: ['report-sync', 'peer-discovery', 'incremental-sync'],
+      capabilities: [
+        'report-sync',
+        'peer-discovery',
+        'incremental-sync',
+        'gossip-ihave-iwant',
+        'gossip-bloom-anti-entropy',
+      ],
+      gossip_protocol_version: '1.0.0',
       created_at: createdAt,
       rate_limits: {
         requests_per_minute: 60,
@@ -2480,6 +2488,179 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
 
     res.set('Content-Type', 'application/json');
     res.send(responseBody);
+  });
+
+  // --- Gossip protocol endpoints (auth required, trusted peers with canSync) ---
+  app.post('/myr/gossip/ihave', (req, res) => {
+    if (!requireTrustedPeer(req, res, 'canSync')) return;
+
+    const ihaveMsg = req.body || {};
+    if (ihaveMsg.type && ihaveMsg.type !== 'ihave') {
+      return errorResponse(res, 'invalid_request', "gossip/ihave payload type must be 'ihave'");
+    }
+    if (!Array.isArray(ihaveMsg.reports)) {
+      return errorResponse(res, 'invalid_request', 'gossip/ihave payload must include reports[]');
+    }
+
+    const receiverSubscriptions = publicKeyHex
+      ? getActiveSubscriptionsForOwner(db, publicKeyHex)
+      : [];
+    const { wanted, ignored } = processIhave({
+      db,
+      ihaveMsg: { ...ihaveMsg, type: 'ihave' },
+      receiverSubscriptions,
+    });
+
+    writeTrace(db, {
+      eventType: 'sync_pull',
+      actorFingerprint: computeFingerprint(req.auth.publicKey),
+      targetFingerprint: publicKeyHex ? computeFingerprint(publicKeyHex) : null,
+      outcome: 'success',
+      metadata: {
+        transport: 'gossip_ihave',
+        offered_reports: ihaveMsg.reports.length,
+        wanted_reports: wanted.length,
+        ignored_reports: ignored,
+      },
+    });
+
+    let iwant = null;
+    if (wanted.length > 0 && publicKeyHex && privateKeyHex) {
+      iwant = buildIwantMessage({
+        signatures: wanted,
+        senderPublicKey: publicKeyHex,
+        senderPrivateKey: privateKeyHex,
+      });
+      writeTrace(db, {
+        eventType: 'sync_push',
+        actorFingerprint: publicKeyHex ? computeFingerprint(publicKeyHex) : null,
+        targetFingerprint: computeFingerprint(req.auth.publicKey),
+        outcome: 'sent',
+        metadata: { transport: 'gossip_iwant', requested_reports: wanted.length },
+      });
+    }
+
+    return res.json({
+      status: 'ok',
+      wanted_signatures: wanted,
+      ignored_reports: ignored,
+      iwant,
+    });
+  });
+
+  app.post('/myr/gossip/iwant', (req, res) => {
+    if (!requireTrustedPeer(req, res, 'canSync')) return;
+
+    const signatures = Array.isArray(req.body?.signatures) ? req.body.signatures : null;
+    if (!signatures) {
+      return errorResponse(res, 'invalid_request', 'gossip/iwant payload must include signatures[]');
+    }
+
+    const uniqueSignatures = [...new Set(signatures.filter((sig) => typeof sig === 'string' && sig.trim()))];
+    if (uniqueSignatures.length === 0) {
+      return res.json({ status: 'ok', reports: [], missing_signatures: [] });
+    }
+
+    const placeholders = uniqueSignatures.map(() => '?').join(',');
+    const rows = db.prepare(`
+      SELECT *
+      FROM myr_reports
+      WHERE share_network = 1
+        AND signed_artifact IN (${placeholders})
+    `).all(...uniqueSignatures);
+
+    const reports = rows.map((row) => ({
+      ...row,
+      signature: row.signed_artifact || row.signature,
+      url: `/myr/reports/${encodeURIComponent(row.signed_artifact || row.signature)}`,
+    }));
+    const found = new Set(reports.map((r) => r.signature));
+    const missingSignatures = uniqueSignatures.filter((sig) => !found.has(sig));
+
+    writeTrace(db, {
+      eventType: 'sync_pull',
+      actorFingerprint: computeFingerprint(req.auth.publicKey),
+      targetFingerprint: publicKeyHex ? computeFingerprint(publicKeyHex) : null,
+      outcome: 'success',
+      metadata: {
+        transport: 'gossip_iwant',
+        requested_reports: uniqueSignatures.length,
+        returned_reports: reports.length,
+      },
+    });
+
+    return res.json({
+      status: 'ok',
+      reports,
+      missing_signatures: missingSignatures,
+    });
+  });
+
+  app.post('/myr/sync/bloom', (req, res) => {
+    if (!requireTrustedPeer(req, res, 'canSync')) return;
+
+    const remoteBloom = req.body?.filter;
+    const remoteParams = req.body?.params;
+    const since = req.body?.since || null;
+
+    const engine = new GossipEngine({
+      db,
+      keys: { publicKey: publicKeyHex || '', privateKey: privateKeyHex || '' },
+      pss: { getActivePeers: () => [], handlePeerFailure: () => {} },
+      fetchFn: null,
+    });
+
+    const localBloom = engine.buildBloomFilter({ since });
+    let missingSignatures = [];
+
+    if (remoteBloom && remoteParams && Number.isFinite(Number(remoteParams.m)) && Number.isFinite(Number(remoteParams.k))) {
+      try {
+        missingSignatures = engine.findMissingInBloom({
+          bloomFilter: remoteBloom,
+          params: remoteParams,
+          since,
+        });
+      } catch {
+        return errorResponse(res, 'invalid_request', 'Invalid bloom filter payload');
+      }
+    }
+
+    let fetchableMissingSignatures = missingSignatures;
+    if (missingSignatures.length > 0) {
+      const placeholders = missingSignatures.map(() => '?').join(',');
+      const rows = db.prepare(`
+        SELECT *
+        FROM myr_reports
+        WHERE share_network = 1
+          AND signed_artifact IN (${placeholders})
+      `).all(...missingSignatures);
+      fetchableMissingSignatures = rows.map((row) => {
+        const reportObj = { ...row };
+        delete reportObj.signature;
+        delete reportObj.operator_signature;
+        const canonical = canonicalize(reportObj);
+        const hash = crypto.createHash('sha256').update(canonical).digest('hex');
+        return `sha256:${hash}`;
+      });
+    }
+
+    writeTrace(db, {
+      eventType: 'sync_pull',
+      actorFingerprint: computeFingerprint(req.auth.publicKey),
+      targetFingerprint: publicKeyHex ? computeFingerprint(publicKeyHex) : null,
+      outcome: 'success',
+      metadata: {
+        transport: 'gossip_bloom',
+        local_count: localBloom.count,
+        remote_missing_count: fetchableMissingSignatures.length,
+      },
+    });
+
+    return res.json({
+      status: 'ok',
+      local_bloom: localBloom,
+      missing_signatures: [...new Set(fetchableMissingSignatures)],
+    });
   });
 
   // --- Yield explainability endpoint ---

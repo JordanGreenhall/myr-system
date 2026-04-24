@@ -1,9 +1,9 @@
 # MYR Operator Guide
 
-**Version:** 1.2.3 (source correction docs)
+**Version:** 1.3.0 (release-grade Gate A/B/C truth)
 **For:** Anyone setting up and running a MYR node
 
-Release authority mapping: npm package version is `1.2.3`; source correction tag `v1.2.3` is authoritative for finalized release-documentation truth.
+Release authority mapping: npm package version is `1.3.0`; source tag `v1.3.0` is authoritative for finalized release-documentation truth.
 
 ---
 

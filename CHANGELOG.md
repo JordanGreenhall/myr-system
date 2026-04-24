@@ -4,6 +4,14 @@
 
 ### Changed
 
+## [1.3.0] — 2026-04-24
+
+### Changed
+
+- Landed Gate A production gossip transport acceptance closure (IHAVE/IWANT + bloom anti-entropy endpoints, capability detection, mixed-mode interop, explicit N=1000 O(N*F) assertion).
+- Carries forward Gate B governance/abuse resistance and Gate C observability/support operations from `f107ef5` into publishable release truth.
+- Bumped release/package authority to `myr-system@1.3.0` and source tag `v1.3.0`.
+
 ## [1.2.3] — 2026-04-24
 
 ### Changed

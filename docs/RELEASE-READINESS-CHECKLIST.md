@@ -8,9 +8,9 @@ This checklist is the repo-level release truth for MYR.
 
 ## Release Authority Mapping
 
-- npm package version and tarball naming are `1.2.3` (`myr-system-1.2.3.tgz`).
-- Source-level correction tag is `v1.2.3` and is authoritative for finalized release-documentation truth.
-- This split is intentional and non-destructive: no existing pushed tag is rewritten.
+- npm package version and tarball naming are `1.3.0` (`myr-system-1.3.0.tgz`).
+- Source-level release tag is `v1.3.0` and is authoritative for finalized release-documentation truth.
+- This is non-destructive: no existing pushed tags are rewritten.
 
 ## Gates
 
@@ -25,14 +25,14 @@ npm run test:release
 
 Observed result:
 
-- `npm test`: `tests 423`, `pass 423`, `fail 0`
+- `npm test`: `tests 436`, `pass 436`, `fail 0`
 - `npm run test:onboarding-truth`: `tests 3`, `pass 3`, `fail 0`, gate status `PASS`
 
 ## Pass/Fail Matrix
 
 | Gate | Status | Evidence |
 |---|---|---|
-| `npm test` | PASS | 423 tests, 122 suites, 0 failures |
+| `npm test` | PASS | 436 tests, 126 suites, 0 failures |
 | `npm run test:release` | PASS | default suite PASS + onboarding truth suite PASS |
 
 ## Included In Release Truth
@@ -43,15 +43,19 @@ Observed result:
 Decision:
 `npm test` remains day-to-day developer truth. `npm run test:release` is the explicit release gate so onboarding truth is mandatory at publish time.
 
-## Files Touched For STA-199
+## Files Touched For STA-214
 
+- `lib/sync.js`
+- `server/index.js`
+- `test/gossip-scale.test.js`
+- `test/server.test.js`
+- `test/gossip-interop.test.js`
 - `package.json`
 - `package-lock.json`
 - `README.md`
 - `CHANGELOG.md`
 - `docs/RELEASE-READINESS-CHECKLIST.md`
-- `docs/RELEASE-NOTES-v1.2.2.md`
-- `docs/RELEASE-NOTES-v1.2.3.md`
+- `docs/RELEASE-NOTES-v1.3.0.md`
 - `docs/OPERATOR-GUIDE.md`
 
 ## Prototype Residue / Non-Release Artifacts
