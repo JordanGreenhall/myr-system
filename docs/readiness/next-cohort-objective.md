@@ -1,7 +1,7 @@
 # Next Cohort Objective: C1 (10 Nodes)
 
 **Date:** 2026-04-24
-**Current state:** C0 (3 nodes), v1.3.1 released
+**Current state:** C0 (3 nodes), v1.3.3 released
 **Target:** C1 — expand from 3 to 10 nodes
 
 ---
@@ -21,7 +21,7 @@
 
 ### Technical Prerequisites
 
-1. **All 486 regression tests passing** (npm test)
+1. **All 539 regression tests passing** (npm test)
 2. **Release acceptance tests passing** (npm run test:release)
 3. **Evidence collection script run** with GO or CONDITIONAL result (scripts/readiness/collect-evidence.sh)
 4. **No Sev1 incidents unresolved** from C0 operation
