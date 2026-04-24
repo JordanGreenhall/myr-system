@@ -1,7 +1,7 @@
 # MYR Readiness Decision Packet
 
 **Date:** 2026-04-24
-**Version:** v1.3.1 (package 1.3.2)
+**Version:** v1.3.3
 **Current cohort:** C0 (3 nodes)
 **Assessment:** CONDITIONAL GO for C1 expansion
 
@@ -9,15 +9,15 @@
 
 ## Executive Summary
 
-MYR is a distributed methodological intelligence network targeting 10,000+ participants. The system is currently operational at C0 (3 nodes) with v1.3.1 released and verified.
+MYR is a distributed methodological intelligence network targeting 10,000+ participants. The system is currently operational at C0 (3 nodes) with v1.3.3 released and verified.
 
 ### Quantitative Position
 
 | Metric | Value |
 |--------|-------|
-| Tests passing | 486 / 486 (100%) |
-| Test suites | 150 |
-| Scale acceptance tests | 4 files, 49 cases (N=50-1,000) |
+| Tests passing | 539 / 539 (100%) |
+| Test suites | 166 |
+| Scale acceptance tests | 4 files, 62 cases (N=50-10,000) |
 | Security assessment | CONDITIONAL PASS (Worf, 2026-04-24) |
 | Core modules | 25 (lib/) |
 | Documentation files | 31 (docs/) |
@@ -43,7 +43,7 @@ MYR is a distributed methodological intelligence network targeting 10,000+ parti
 - Key rotation mechanism
 - Rate limiting (60 req/min per peer)
 - NAT traversal via relay
-- Domain coordinator routing (Phase 4 prototype)
+- Domain coordinator routing with 10,000-peer validated economics
 - Onboarding with 3-way fingerprint verification
 
 **Not yet proven at scale:**
@@ -71,10 +71,10 @@ C0 (3)  ──GO?──>  C1 (10)  ──GO?──>  C2 (50)  ──GO?──>  
 
 | # | Criterion | Current Status |
 |---|-----------|---------------|
-| 1 | All regression tests pass (486/486) | PASS |
+| 1 | All regression tests pass (539/539) | PASS |
 | 2 | Scale acceptance tests pass at N >= 10 | PASS (tested to N=200) |
-| 3 | Gossip transport operational (IHAVE/IWANT, peer sampling) | PASS (v1.3.0) |
-| 4 | Governance signal propagation tested | PASS (v1.3.0) |
+| 3 | Gossip transport operational (IHAVE/IWANT, peer sampling) | PASS (v1.3.3) |
+| 4 | Governance signal propagation tested | PASS (v1.3.3) |
 | 5 | Onboarding procedure documented | PASS (NODE-ONBOARDING.md) |
 | 6 | Operator guide available | PASS (OPERATOR-GUIDE.md) |
 | 7 | Support operations defined (Sev1/2/3 triage) | PASS (SUPPORT-OPERATIONS.md) |

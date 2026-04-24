@@ -43,19 +43,20 @@ record_check() {
 }
 
 # --- Check 1: Regression tests ---
-log "Running regression tests (npm test)..."
+log "Running regression tests (npm test -- --runInBand)..."
 cd "$PROJECT_ROOT"
-TEST_OUTPUT=$(npm test 2>&1) || true
+TEST_OUTPUT=$(npm test -- --runInBand 2>&1) || true
 
-# Parse test results from node --test output
-if echo "$TEST_OUTPUT" | grep -q "# fail 0"; then
-  TEST_TOTAL=$(echo "$TEST_OUTPUT" | grep "# tests" | tail -1 | awk '{print $3}')
-  TEST_PASS=$(echo "$TEST_OUTPUT" | grep "# pass" | tail -1 | awk '{print $3}')
-  TEST_SUITES=$(echo "$TEST_OUTPUT" | grep "# suites" | tail -1 | awk '{print $3}')
+# Parse test results from node --test output (handles both "# " and "ℹ " prefixes)
+TEST_FAIL_NUM=$(echo "$TEST_OUTPUT" | grep -E "^(#|ℹ) fail " | tail -1 | awk '{print $NF}')
+TEST_TOTAL=$(echo "$TEST_OUTPUT" | grep -E "^(#|ℹ) tests " | tail -1 | awk '{print $NF}')
+TEST_PASS=$(echo "$TEST_OUTPUT" | grep -E "^(#|ℹ) pass " | tail -1 | awk '{print $NF}')
+TEST_SUITES=$(echo "$TEST_OUTPUT" | grep -E "^(#|ℹ) suites " | tail -1 | awk '{print $NF}')
+
+if [ -n "$TEST_FAIL_NUM" ] && [ "$TEST_FAIL_NUM" = "0" ]; then
   record_check "regression_tests" "PASS" "${TEST_PASS:-all}/${TEST_TOTAL:-all} tests, ${TEST_SUITES:-?} suites, 0 failures"
-elif echo "$TEST_OUTPUT" | grep -q "# fail"; then
-  FAIL_NUM=$(echo "$TEST_OUTPUT" | grep "# fail" | tail -1 | awk '{print $3}')
-  record_check "regression_tests" "FAIL" "$FAIL_NUM test failures detected"
+elif [ -n "$TEST_FAIL_NUM" ] && [ "$TEST_FAIL_NUM" != "0" ]; then
+  record_check "regression_tests" "FAIL" "$TEST_FAIL_NUM test failures detected"
 else
   # Fallback: check exit code style
   if echo "$TEST_OUTPUT" | grep -qi "error\|failed"; then
