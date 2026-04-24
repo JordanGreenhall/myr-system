@@ -126,16 +126,16 @@ Anti-entropy exchange:
 
 **Bloom filter sizing:** For 10,000 reports, a 16KB Bloom filter gives <1% false positive rate. This is transmitted once per anti-entropy round instead of paginating through the full report list.
 
-#### 5. Coordinator Nodes (Optional, Phase 2)
+#### 5. Coordinator Nodes (Phase 2 — required for 10,000+ goal)
 
-For networks >5,000 nodes, introduce **domain coordinators**:
+For networks beyond ~2,000 nodes, **domain coordinators** become necessary:
 
 - Nodes with high uptime and connectivity volunteer as coordinators for specific domain tags
 - Coordinators maintain a complete view of reports in their domain
 - Leaf nodes can sync exclusively through their domain coordinator
 - Coordinators gossip with each other for cross-domain propagation
 
-This is NOT required for 1,000 nodes and is listed as future work.
+Coordinator design and prototyping must begin before 1,000 nodes, not after. 1,000 participants is a hard market-significant intermediate rung — by the time MYR reaches it, coordinator architecture must already be validated. The project goal is 10,000+ participants; deferring coordinator work until post-1,000 creates a scaling cliff at exactly the moment operational demands are highest.
 
 ### Message Complexity Comparison
 
@@ -173,8 +173,9 @@ The gossip architecture preserves all existing MYR invariants:
 
 ### Phase 0: Preparation (current release, v1.2.x)
 - No protocol changes
-- Release can honestly state: "works for 3–100 nodes; scale architecture designed, not yet implemented"
+- Release can honestly state: "works for 3–100 nodes; scale architecture designed for 10,000+ goal, not yet implemented"
 - This ADR is the deliverable
+- 10,000+ readiness work (governance, observability, abuse resistance, operational procedures) begins in this phase alongside protocol design
 
 ### Phase 1: Bounded Fanout (v1.3.0)
 1. Add `lib/gossip.js` with peer sampling service and push-lazy dissemination
@@ -194,10 +195,10 @@ The gossip architecture preserves all existing MYR invariants:
 2. Add `/myr/sync/bloom` endpoint
 3. Remove full-mesh pull from default sync schedule (keep as manual command)
 
-### Phase 4: Coordinators (v2.0, if needed)
+### Phase 4: Coordinators (v1.5.0 — pre-1,000 delivery required)
 1. Domain coordinator election protocol
 2. Coordinator-to-coordinator gossip ring
-3. Only needed if network exceeds ~5,000 nodes
+3. Required for the 10,000+ project goal; design and prototype must be validated before 1,000 nodes to avoid a scaling cliff
 
 ### Backward Compatibility
 
@@ -221,14 +222,15 @@ The prototype implements Phase 1 core: peer sampling + push-lazy IHAVE/IWANT. Se
 ### Remaining Risks
 1. **Peer sampling protocol is unimplemented.** The current prototype uses static peer selection. Production deployment requires the full HyParView shuffle protocol (Phase 1 deliverable).
 2. **Bloom filter anti-entropy is designed but not prototyped.** The existing cursor-based pull works but is less efficient for repair scenarios.
-3. **Coordinator election is future work.** Networks >5,000 nodes will need this, but it is not required for the 1,000-node target.
+3. **Coordinator election is designed but unimplemented.** The 10,000+ project goal requires coordinators. Design and prototype validation must happen before 1,000 nodes; 1,000 is an intermediate rung, not the destination.
 4. **NAT traversal at scale.** The relay mechanism works 1:1 but has not been tested as a gossip intermediary. Relay nodes may become bottlenecks if many nodes are behind NAT.
 5. **Subscription completeness.** If nodes don't declare subscriptions, they receive all reports. Subscription adoption is a social/UX problem, not a protocol problem.
 6. **No formal verification.** Convergence properties are argued from epidemic dissemination theory (Kermarrec et al., 2003) but not formally verified for this specific protocol.
+7. **10,000+ operational readiness gaps.** Beyond protocol scaling, the following are required for 10,000+ operation and must begin before 1,000 nodes: governance/abuse resistance framework, network-wide observability and support operations, routing economics model, trust-weighted retrieval at scale, onboarding resilience under load, launch/pilot operating procedures, and recovery/failure runbooks.
 
-### Honest Scale Claims for v1.2.0 Release
+### Honest Scale Claims for v1.2.x Release
 
-> MYR v1.2.0 supports networks of 3–100 nodes using direct peer-to-peer sync. A bounded-fanout gossip architecture has been designed and partially prototyped that provides a credible path to 1,000+ node networks. The gossip protocol reduces message complexity from O(N^2) to O(N), maintains all existing cryptographic guarantees, and supports incremental migration from the current pull-based model. Full gossip support is planned for v1.3.0.
+> MYR v1.2.x supports networks of 3–100 nodes using direct peer-to-peer sync. A bounded-fanout gossip architecture has been designed and partially prototyped that provides a credible scaling path. The gossip protocol reduces message complexity from O(N^2) to O(N), maintains all existing cryptographic guarantees, and supports incremental migration from the current pull-based model. Full gossip support is planned for v1.3.0. The project goal is a 10,000+ participant methodological intelligence network. 1,000 participants is a hard market-significant intermediate rung on that path — not the destination. Substantial 10,000-readiness work (coordinator architecture, governance, abuse resistance, observability, support operations, routing economics, and recovery procedures) must proceed in parallel with the path to 1,000, not be deferred until after it.
 
 ## References
 
