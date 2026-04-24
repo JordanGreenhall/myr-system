@@ -44,6 +44,7 @@ const {
 } = require('../lib/subscriptions');
 const { createLogger } = require('../lib/logging');
 const { processIhave, buildIwantMessage, GossipEngine } = require('../lib/gossip');
+const { DomainCoordinator } = require('../lib/coordinator');
 
 function loadPublicKeyHex(keysPath, nodeId) {
   const publicKeyPath = path.join(keysPath, `${nodeId}.public.pem`);
@@ -316,6 +317,10 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
   ensureSubscriptionsSchema(db);
   ensureGovernanceGossipSchema(db);
   ensureRoutingEconomicsSchema(db);
+
+  // Domain coordinator for routing-aware gossip (Phase 4)
+  const coordinator = new DomainCoordinator();
+  coordinator.syncFromDatabase(db);
 
   app.use(createIpRateLimiter({
     windowMs: 60 * 1000,
@@ -2725,6 +2730,73 @@ function createApp({ config, db, publicKeyHex, createdAt, privateKeyHex }) {
 
     res.json(responseBody);
   });
+
+  // --- Coordinator endpoints (domain-aware routing, Phase 4) ---
+
+  app.post('/myr/coordinator/register', (req, res) => {
+    if (!requireTrustedPeer(req, res, 'canSync')) return;
+
+    const { domains, peer_url } = req.body || {};
+    if (!domains || (Array.isArray(domains) && domains.length === 0)) {
+      return errorResponse(res, 'invalid_request',
+        'coordinator/register requires domains[] with at least one domain tag');
+    }
+
+    const peerPublicKey = req.auth.publicKey;
+    const peerRow = safeGet(db, 'SELECT operator_name FROM myr_peers WHERE public_key = ?', peerPublicKey);
+
+    try {
+      const result = coordinator.register(peerPublicKey, domains, {
+        operatorName: peerRow?.operator_name || null,
+        peerUrl: peer_url || null,
+      });
+
+      writeTrace(db, {
+        eventType: 'coordinator_register',
+        actorFingerprint: computeFingerprint(peerPublicKey),
+        targetFingerprint: publicKeyHex ? computeFingerprint(publicKeyHex) : null,
+        outcome: 'success',
+        metadata: { domains: result.domains, peerCount: coordinator.getStats().peerCount },
+      });
+
+      return res.json({ status: 'ok', ...result });
+    } catch (err) {
+      return errorResponse(res, 'invalid_request', err.message);
+    }
+  });
+
+  app.get('/myr/coordinator/route', (req, res) => {
+    if (!requireTrustedPeer(req, res, 'canSync')) return;
+
+    const domain = req.query.domain;
+    if (!domain || typeof domain !== 'string' || !domain.trim()) {
+      return errorResponse(res, 'invalid_request',
+        'coordinator/route requires ?domain=<tag> query parameter');
+    }
+
+    const peers = coordinator.route(domain.trim());
+    return res.json({
+      status: 'ok',
+      domain: normalizeTags([domain.trim()])[0],
+      peers,
+      peerCount: peers.length,
+    });
+  });
+
+  app.get('/myr/coordinator/domains', (req, res) => {
+    if (!requireTrustedPeer(req, res, 'canSync')) return;
+
+    const domains = coordinator.listDomains();
+    const stats = coordinator.getStats();
+    return res.json({
+      status: 'ok',
+      domains,
+      stats,
+    });
+  });
+
+  // Expose coordinator on the app for gossip integration
+  app.coordinator = coordinator;
 
   return app;
 }
