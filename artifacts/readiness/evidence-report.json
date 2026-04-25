@@ -1,13 +1,64 @@
 {
-  "timestamp": "2026-04-25T00:38:25Z",
-  "version": "1.3.6",
+  "timestamp": "2026-04-25T01:22:03Z",
+  "version": "1.3.7",
   "recommendation": "GO",
-  "reason": "All checks passed (8 pass, 2 warnings)",
+  "reason": "All checks passed (9 pass, 1 warnings)",
   "summary": {
-    "pass": 8,
+    "pass": 9,
     "fail": 0,
-    "warn": 2,
+    "warn": 1,
     "total": 10
   },
-  "checks": [{"name":"regression_tests","status":"PASS","detail":"539/539 tests, 166 suites, 0 failures"},{"name":"release_acceptance","status":"PASS","detail":"Release acceptance tests passed"},{"name":"git_clean","status":"WARN","detail":"7 uncommitted changes"},{"name":"package_version","status":"PASS","detail":"v1.3.6"},{"name":"git_tag","status":"PASS","detail":"Latest tag: v1.3.5"},{"name":"documentation","status":"PASS","detail":"All 11 required docs present"},{"name":"scale_tests","status":"PASS","detail":"4 scale/load test files found"},{"name":"slo_tooling","status":"PASS","detail":"scripts/slo-check.js exists"},{"name":"endpoint_health","status":"WARN","detail":"No --endpoint provided; skipping live checks"},{"name":"runbooks","status":"PASS","detail":"5 recovery procedures documented"}]
+  "checks": [
+    {
+      "name": "regression_tests",
+      "status": "PASS",
+      "detail": "539/539 tests, 166 suites, 0 failures"
+    },
+    {
+      "name": "release_acceptance",
+      "status": "PASS",
+      "detail": "Release acceptance tests passed"
+    },
+    {
+      "name": "git_clean",
+      "status": "PASS",
+      "detail": "Working tree is clean"
+    },
+    {
+      "name": "package_version",
+      "status": "PASS",
+      "detail": "v1.3.7"
+    },
+    {
+      "name": "git_tag",
+      "status": "PASS",
+      "detail": "Latest tag: v1.3.7"
+    },
+    {
+      "name": "documentation",
+      "status": "PASS",
+      "detail": "All 11 required docs present"
+    },
+    {
+      "name": "scale_tests",
+      "status": "PASS",
+      "detail": "4 scale/load test files found"
+    },
+    {
+      "name": "slo_tooling",
+      "status": "PASS",
+      "detail": "scripts/slo-check.js exists"
+    },
+    {
+      "name": "endpoint_health",
+      "status": "WARN",
+      "detail": "No --endpoint provided; skipping live checks"
+    },
+    {
+      "name": "runbooks",
+      "status": "PASS",
+      "detail": "5 recovery procedures documented"
+    }
+  ]
 }

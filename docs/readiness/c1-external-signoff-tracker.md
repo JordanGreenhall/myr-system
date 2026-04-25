@@ -1,7 +1,7 @@
 # C1 External Signoff Tracker
 
 **Date:** 2026-04-25
-**Version:** v1.3.6
+**Version:** v1.3.7
 **Assessor:** Number Two (XO)
 **Overall status:** CONDITIONAL GO — awaiting operator signoffs
 
@@ -25,7 +25,7 @@ This is the single authoritative tracker for all external (non-automated) action
 | SLO tooling | PASS | `scripts/slo-check.js` exists |
 | Pilot scripts | PASS | All 3 scripts present |
 | Documentation | PASS | All 7 required docs present |
-| Package/tag truth | PASS | v1.3.6, HEAD == origin/main == v1.3.6 tag |
+| Package/tag truth | PASS | v1.3.7, HEAD == origin/main == v1.3.7 tag |
 
 Last automated run: `bash scripts/pilot/c1-rehearsal-gate.sh` — **14 PASS, 0 FAIL, 4 EXTERNAL GATES**
 
