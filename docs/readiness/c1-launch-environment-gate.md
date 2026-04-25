@@ -1,7 +1,7 @@
 # C1 Launch Environment Gate
 
 **Date:** 2026-04-24
-**Version:** v1.3.5
+**Version:** v1.3.6
 **Gate status:** BLOCKED — requires operator action
 
 ---

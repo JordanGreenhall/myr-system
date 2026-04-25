@@ -1,7 +1,7 @@
 # MYR Readiness Evidence Report
 
-**Collected:** 2026-04-24T23:34:22Z
-**Version:** v1.3.5
+**Collected:** 2026-04-25T00:38:25Z
+**Version:** v1.3.6
 **Recommendation:** **GO** — All checks passed (8 pass, 2 warnings)
 
 ## Summary
@@ -19,9 +19,9 @@
 |-------|--------|--------|
 | regression_tests | PASS | 539/539 tests, 166 suites, 0 failures |
 | release_acceptance | PASS | Release acceptance tests passed |
-| git_clean | WARN | 8 uncommitted changes |
-| package_version | PASS | v1.3.5 |
-| git_tag | PASS | Latest tag: v1.3.5 (release tag created with this commit) |
+| git_clean | WARN | 7 uncommitted changes |
+| package_version | PASS | v1.3.6 |
+| git_tag | PASS | Latest tag: v1.3.5 |
 | documentation | PASS | All 11 required docs present |
 | scale_tests | PASS | 4 scale/load test files found |
 | slo_tooling | PASS | scripts/slo-check.js exists |
