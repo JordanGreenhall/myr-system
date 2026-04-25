@@ -45,31 +45,42 @@ record_check() {
 # --- Check 1: Regression tests ---
 log "Running regression tests (npm test -- --runInBand)..."
 cd "$PROJECT_ROOT"
-TEST_OUTPUT=$(npm test -- --runInBand 2>&1) || true
+set +e
+TEST_OUTPUT=$(npm test -- --runInBand 2>&1)
+TEST_EXIT=$?
+set -e
 
-# Parse test results from node --test output (handles both "# " and "ℹ " prefixes)
-TEST_FAIL_NUM=$(echo "$TEST_OUTPUT" | grep -E "^(#|ℹ) fail " | tail -1 | awk '{print $NF}')
-TEST_TOTAL=$(echo "$TEST_OUTPUT" | grep -E "^(#|ℹ) tests " | tail -1 | awk '{print $NF}')
-TEST_PASS=$(echo "$TEST_OUTPUT" | grep -E "^(#|ℹ) pass " | tail -1 | awk '{print $NF}')
-TEST_SUITES=$(echo "$TEST_OUTPUT" | grep -E "^(#|ℹ) suites " | tail -1 | awk '{print $NF}')
+extract_counter() {
+  local key="$1"
+  printf '%s\n' "$TEST_OUTPUT" | sed -nE "s/^[#ℹ[:space:]]*$key[[:space:]]+([0-9]+).*/\1/p" | tail -1
+}
 
-if [ -n "$TEST_FAIL_NUM" ] && [ "$TEST_FAIL_NUM" = "0" ]; then
+TEST_FAIL_NUM="$(extract_counter fail || true)"
+TEST_TOTAL="$(extract_counter tests || true)"
+TEST_PASS="$(extract_counter pass || true)"
+TEST_SUITES="$(extract_counter suites || true)"
+
+if [ "$TEST_EXIT" -ne 0 ]; then
+  if [ -n "$TEST_FAIL_NUM" ]; then
+    record_check "regression_tests" "FAIL" "$TEST_FAIL_NUM test failures detected"
+  else
+    record_check "regression_tests" "FAIL" "npm test exited non-zero"
+  fi
+elif [ -n "$TEST_FAIL_NUM" ] && [ "$TEST_FAIL_NUM" = "0" ]; then
   record_check "regression_tests" "PASS" "${TEST_PASS:-all}/${TEST_TOTAL:-all} tests, ${TEST_SUITES:-?} suites, 0 failures"
 elif [ -n "$TEST_FAIL_NUM" ] && [ "$TEST_FAIL_NUM" != "0" ]; then
   record_check "regression_tests" "FAIL" "$TEST_FAIL_NUM test failures detected"
 else
-  # Fallback: check exit code style
-  if echo "$TEST_OUTPUT" | grep -qi "error\|failed"; then
-    record_check "regression_tests" "FAIL" "Test run produced errors"
-  else
-    record_check "regression_tests" "PASS" "All tests passed (count not parsed)"
-  fi
+  record_check "regression_tests" "PASS" "All tests passed (count not parsed)"
 fi
 
 # --- Check 2: Release acceptance tests ---
 log "Running release acceptance tests (npm run test:release)..."
-RELEASE_OUTPUT=$(npm run test:release 2>&1) || true
-if echo "$RELEASE_OUTPUT" | grep -q "# fail 0" || ! echo "$RELEASE_OUTPUT" | grep -qi "fail\|error"; then
+set +e
+RELEASE_OUTPUT=$(npm run test:release 2>&1)
+RELEASE_EXIT=$?
+set -e
+if [ "$RELEASE_EXIT" -eq 0 ]; then
   record_check "release_acceptance" "PASS" "Release acceptance tests passed"
 else
   record_check "release_acceptance" "FAIL" "Release acceptance tests failed"

@@ -23,6 +23,17 @@ print_result() {
   esac
 }
 
+read_evidence_check() {
+  local key="$1"
+  node -e '
+const fs = require("fs");
+const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+const key = process.argv[2];
+const c = (report.checks || []).find((item) => item.name === key) || {};
+process.stdout.write(`${c.status || "UNKNOWN"}|${c.detail || "missing"}`);
+' "$REPO_ROOT/artifacts/readiness/evidence-report.json" "$key"
+}
+
 echo "========================================="
 echo "  MYR C1 Launch-Day Rehearsal Gate"
 echo "========================================="
@@ -32,45 +43,44 @@ echo "Time:    $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 echo ""
 
 # -----------------------------------------------
-# Gate 1: Regression tests
+# Gate 1-3: Single authoritative evidence pass
 # -----------------------------------------------
-echo "--- Gate 1: Regression Tests ---"
+echo "--- Gate 1-3: Automated Evidence ---"
 cd "$REPO_ROOT"
-if npm test --silent 2>/dev/null; then
-  TEST_COUNT=$(npm test --silent 2>&1 | grep -oE '[0-9]+ passing' | head -1 || echo "unknown passing")
-  print_result PASS "Regression tests" "$TEST_COUNT"
-else
-  print_result FAIL "Regression tests" "npm test failed"
-fi
-
-# -----------------------------------------------
-# Gate 2: Release acceptance tests
-# -----------------------------------------------
-echo ""
-echo "--- Gate 2: Release Acceptance ---"
-if npm run test:release --silent 2>/dev/null; then
-  print_result PASS "Release acceptance" "npm run test:release passed"
-else
-  print_result FAIL "Release acceptance" "npm run test:release failed"
-fi
-
-# -----------------------------------------------
-# Gate 3: Evidence collection
-# -----------------------------------------------
-echo ""
-echo "--- Gate 3: Evidence Collection ---"
 if [ -x "$REPO_ROOT/scripts/readiness/collect-evidence.sh" ]; then
-  EVIDENCE_OUT=$(bash "$REPO_ROOT/scripts/readiness/collect-evidence.sh" 2>&1) || true
-  if [ -f "$REPO_ROOT/artifacts/readiness/evidence-report.json" ]; then
-    REC=$(node -e "const fs=require('fs'); const r=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); console.log(r.recommendation || 'UNKNOWN')" "$REPO_ROOT/artifacts/readiness/evidence-report.json")
-    FAILS=$(node -e "const fs=require('fs'); const r=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); console.log((r.summary && Number.isFinite(r.summary.fail)) ? r.summary.fail : 0)" "$REPO_ROOT/artifacts/readiness/evidence-report.json")
-    if [ "$FAILS" = "0" ]; then
-      print_result PASS "Evidence collection" "recommendation=$REC, 0 failures"
+  if bash "$REPO_ROOT/scripts/readiness/collect-evidence.sh" >/tmp/myr-evidence.log 2>&1; then
+    if [ -f "$REPO_ROOT/artifacts/readiness/evidence-report.json" ]; then
+      REGRESSION_RAW="$(read_evidence_check "regression_tests")"
+      RELEASE_RAW="$(read_evidence_check "release_acceptance")"
+      REGRESSION_STATUS="${REGRESSION_RAW%%|*}"
+      REGRESSION_DETAIL="${REGRESSION_RAW#*|}"
+      RELEASE_STATUS="${RELEASE_RAW%%|*}"
+      RELEASE_DETAIL="${RELEASE_RAW#*|}"
+
+      if [ "$REGRESSION_STATUS" = "PASS" ]; then
+        print_result PASS "Regression tests" "$REGRESSION_DETAIL"
+      else
+        print_result FAIL "Regression tests" "$REGRESSION_DETAIL"
+      fi
+
+      if [ "$RELEASE_STATUS" = "PASS" ]; then
+        print_result PASS "Release acceptance" "$RELEASE_DETAIL"
+      else
+        print_result FAIL "Release acceptance" "$RELEASE_DETAIL"
+      fi
+
+      REC=$(node -e "const fs=require('fs'); const r=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); console.log(r.recommendation || 'UNKNOWN')" "$REPO_ROOT/artifacts/readiness/evidence-report.json")
+      FAILS=$(node -e "const fs=require('fs'); const r=JSON.parse(fs.readFileSync(process.argv[1],'utf8')); console.log((r.summary && Number.isFinite(r.summary.fail)) ? r.summary.fail : 0)" "$REPO_ROOT/artifacts/readiness/evidence-report.json")
+      if [ "$FAILS" = "0" ]; then
+        print_result PASS "Evidence collection" "recommendation=$REC, 0 failures"
+      else
+        print_result FAIL "Evidence collection" "recommendation=$REC, $FAILS failures"
+      fi
     else
-      print_result FAIL "Evidence collection" "recommendation=$REC, $FAILS failures"
+      print_result FAIL "Evidence collection" "evidence-report.json not generated"
     fi
   else
-    print_result FAIL "Evidence collection" "evidence-report.json not generated"
+    print_result FAIL "Evidence collection" "collect-evidence.sh failed; see /tmp/myr-evidence.log"
   fi
 else
   print_result FAIL "Evidence collection" "collect-evidence.sh not found or not executable"
@@ -109,13 +119,11 @@ fi
 # -----------------------------------------------
 echo ""
 echo "--- Gate 6: Pilot Scripts ---"
-SCRIPTS_OK=true
 for SCRIPT in verify-node-health.sh verify-cohort-status.sh onboard-new-peer.sh; do
   if [ -f "$REPO_ROOT/scripts/pilot/$SCRIPT" ]; then
     print_result PASS "Pilot script" "$SCRIPT exists"
   else
     print_result FAIL "Pilot script" "$SCRIPT missing"
-    SCRIPTS_OK=false
   fi
 done
 
@@ -124,13 +132,11 @@ done
 # -----------------------------------------------
 echo ""
 echo "--- Gate 7: Documentation ---"
-DOCS_OK=true
 for DOC in docs/OPERATOR-GUIDE.md docs/SUPPORT-OPERATIONS.md docs/RUNBOOKS.md docs/readiness/decision-packet.md docs/pilot-packet/incident-response-card.md docs/readiness/c1-operator-briefing-checklist.md docs/readiness/c1-launch-environment-gate.md; do
   if [ -f "$REPO_ROOT/$DOC" ]; then
     print_result PASS "Documentation" "$DOC"
   else
     print_result FAIL "Documentation" "$DOC missing"
-    DOCS_OK=false
   fi
 done
 
